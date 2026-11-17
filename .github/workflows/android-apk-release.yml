@@ -24,37 +24,39 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
-          cache: 'npm'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
 
       - name: Setup Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: 'temurin'
           java-version: '21'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install dependencies
-        run: npm ci || npm install
+        run: bun install --frozen-lockfile
 
       - name: Run unit tests & TypeScript check
         run: |
-          npm run test
-          npm run lint
+          bun run test
+          bun run lint
 
       - name: Build web bundle & sync Capacitor Android
         env:
           VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || '' }}
         run: |
-          npm run build
-          npx cap sync android
+          bun run build
+          bunx cap sync android
 
       - name: Build Android APKs
         working-directory: android
@@ -101,13 +103,13 @@ jobs:
           fi
 
       - name: Upload APK workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: FishCast-APK-${{ steps.tag.outputs.tag }}
           path: release-apks/*.apk
 
       - name: Create GitHub Release with APK
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "Клёвый прогноз (FishCast AI) ${{ steps.tag.outputs.tag }}"
