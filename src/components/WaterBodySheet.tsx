@@ -5,15 +5,20 @@ import {
   Car,
   CheckCircle2,
   Compass,
+  Download,
   ExternalLink,
   Fish,
   Footprints,
+  Image as ImageIcon,
+  Layers,
   Navigation2,
   Radar,
   RefreshCw,
   ShieldAlert,
   Star,
   Thermometer,
+  Trash2,
+  Upload,
   Waves,
   Wind,
   X,
@@ -33,10 +38,13 @@ import {
 } from 'recharts';
 import {
   buildBathymetryProfile,
+  buildSampleSonarCsv,
   getExpectedFishForWaterBody,
+  parseSonarDepthFile,
   waterBodyTypeRu,
   type BathymetryProfileLineMode,
   type BathymetryProfilePoint,
+  type SonarImportPoint,
 } from '../lib/fishLogic';
 import type {
   BathymetryPoint,
@@ -69,6 +77,14 @@ interface WaterBodySheetProps {
   reconRunning: boolean;
   onRunRecon: () => void;
   onAddDepthPoint: (payload: { lat: number; lng: number; depth_m: number; source: 'manual' | 'sonar' }) => Promise<string | null>;
+  onImportDepthPoints?: (points: SonarImportPoint[]) => Promise<{ importedCount: number; error?: string }>;
+  historicOverlay?: { waterBodyId: string; fileName: string } | null;
+  historicOpacity?: number;
+  onChangeHistoricOpacity?: (val: number) => void;
+  onUploadHistoricMap?: (file: File) => Promise<string | null>;
+  onClearHistoricMap?: () => void;
+  openSeaMapEnabled?: boolean;
+  onToggleOpenSeaMap?: (enabled: boolean) => void;
   pickDepthMode: boolean;
   onTogglePickDepthMode: () => void;
   pickedCoords: LatLng | null;
@@ -116,6 +132,14 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
   reconRunning,
   onRunRecon,
   onAddDepthPoint,
+  onImportDepthPoints,
+  historicOverlay = null,
+  historicOpacity = 0.55,
+  onChangeHistoricOpacity,
+  onUploadHistoricMap,
+  onClearHistoricMap,
+  openSeaMapEnabled = false,
+  onToggleOpenSeaMap,
   pickDepthMode,
   onTogglePickDepthMode,
   pickedCoords,
@@ -138,6 +162,10 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
   const [depthSource, setDepthSource] = useState<'manual' | 'sonar'>('manual');
   const [depthError, setDepthError] = useState<string | null>(null);
   const [depthSavedMsg, setDepthSavedMsg] = useState<string | null>(null);
+  const [sonarImporting, setSonarImporting] = useState(false);
+  const [sonarImportMsg, setSonarImportMsg] = useState<string | null>(null);
+  const [sonarImportErr, setSonarImportErr] = useState<string | null>(null);
+  const [historicErr, setHistoricErr] = useState<string | null>(null);
 
   const expectedFish = useMemo(
     () => getExpectedFishForWaterBody({ waterBody, speciesList, reports }),
@@ -1058,6 +1086,222 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                 Сохранить промер глубины
               </button>
             </form>
+
+            {/* Sonar Log Importer (CSV / GPX -> Live Auto-Isobaths) */}
+            {onImportDepthPoints && (
+              <div className="rounded-2xl border border-slate-200 p-3.5 space-y-2.5 dark:border-slate-800">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-900 dark:text-slate-100">
+                    <Upload className="h-4 w-4 text-teal-700 dark:text-teal-400" aria-hidden="true" />
+                    Импорт логов эхолота (CSV / GPX)
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const csv = buildSampleSonarCsv(waterBody);
+                      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `sonar-${waterBody.id}.csv`;
+                      document.body.appendChild(a);
+                      a.click();
+                      a.remove();
+                      URL.revokeObjectURL(url);
+                    }}
+                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-sky-700 hover:underline dark:text-sky-400"
+                  >
+                    <Download className="h-3 w-3" aria-hidden="true" />
+                    Пример CSV
+                  </button>
+                </div>
+
+                <p className="text-[11px] leading-relaxed text-slate-600 dark:text-slate-400">
+                  Поддерживаются выгрузки <strong>Deeper</strong>, <strong>Garmin ActiveCaptain / Quickdraw</strong>,{' '}
+                  <strong>Lowrance / Humminbird CSV</strong> и <strong>GPX</strong>. После загрузки изобаты на карте
+                  строятся автоматически.
+                </p>
+
+                <label className="flex min-h-[42px] cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-teal-600/45 bg-teal-50/60 px-3 py-2 text-xs font-semibold text-teal-900 hover:bg-teal-50 dark:border-teal-500/40 dark:bg-teal-950/30 dark:text-teal-200 dark:hover:bg-teal-950/50">
+                  <Upload className="h-4 w-4 shrink-0" aria-hidden="true" />
+                  <span>{sonarImporting ? 'Импорт промеров...' : 'Выбрать файл .csv, .txt или .gpx'}</span>
+                  <input
+                    type="file"
+                    accept=".csv,.txt,.gpx,text/csv,application/gpx+xml"
+                    disabled={sonarImporting}
+                    className="sr-only"
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = '';
+                      if (!file) return;
+                      setSonarImportErr(null);
+                      setSonarImportMsg(null);
+                      if (file.size > 2 * 1024 * 1024) {
+                        setSonarImportErr('Файл превышает лимит 2 МБ.');
+                        return;
+                      }
+                      setSonarImporting(true);
+                      try {
+                        const text = await file.text();
+                        const parsed = parseSonarDepthFile(text, file.name);
+                        if (parsed.error || parsed.points.length === 0) {
+                          setSonarImportErr(parsed.error ?? 'Не удалось прочитать глубины из файла.');
+                          return;
+                        }
+                        const res = await onImportDepthPoints(parsed.points);
+                        if (res.error) {
+                          setSonarImportErr(res.error);
+                        } else {
+                          const extra = parsed.downsampled ? ' (сжато до 400 точек)' : '';
+                          setSonarImportMsg(
+                            `Загружено ${res.importedCount} промеров (${parsed.format.toUpperCase()})${extra} — изобаты обновлены.`
+                          );
+                        }
+                      } catch {
+                        setSonarImportErr('Не удалось прочитать файл лога эхолота.');
+                      } finally {
+                        setSonarImporting(false);
+                      }
+                    }}
+                  />
+                </label>
+
+                {sonarImportErr && <p className="text-xs font-medium text-rose-700 dark:text-rose-400">{sonarImportErr}</p>}
+                {sonarImportMsg && <p className="text-xs font-medium text-teal-700 dark:text-teal-400">{sonarImportMsg}</p>}
+              </div>
+            )}
+
+            {/* Historic Pre-Flood Riverbed Map Image Overlay */}
+            {onUploadHistoricMap && (
+              <div className="rounded-2xl border border-slate-200 p-3.5 space-y-2.5 dark:border-slate-800">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-900 dark:text-slate-100">
+                    <ImageIcon className="h-4 w-4 text-amber-600 dark:text-amber-400" aria-hidden="true" />
+                    Подложка старой карты (до затопления)
+                  </h3>
+                  {historicOverlay && historicOverlay.waterBodyId === waterBody.id && onClearHistoricMap && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setHistoricErr(null);
+                        onClearHistoricMap();
+                      }}
+                      className="inline-flex items-center gap-1 text-[11px] font-semibold text-rose-600 hover:underline dark:text-rose-400"
+                    >
+                      <Trash2 className="h-3 w-3" aria-hidden="true" />
+                      Убрать
+                    </button>
+                  )}
+                </div>
+
+                <p className="text-[11px] leading-relaxed text-slate-600 dark:text-slate-400">
+                  Наложите скриншот довоенной карты русла (РККА / Шуберт / Менде) поверх акватории, чтобы видеть старое
+                  русло, овраги и броды.
+                </p>
+
+                {historicOverlay && historicOverlay.waterBodyId === waterBody.id ? (
+                  <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50/70 p-2.5 dark:border-amber-900/50 dark:bg-amber-950/30">
+                    <div className="flex items-center justify-between text-[11px] font-semibold text-amber-900 dark:text-amber-200">
+                      <span className="truncate">{historicOverlay.fileName}</span>
+                      <span className="font-mono shrink-0 ml-2">{Math.round(historicOpacity * 100)}%</span>
+                    </div>
+                    {onChangeHistoricOpacity && (
+                      <input
+                        type="range"
+                        aria-label="Прозрачность старой карты"
+                        min={10}
+                        max={100}
+                        step={5}
+                        value={Math.round(historicOpacity * 100)}
+                        onChange={(e) => onChangeHistoricOpacity(Number(e.target.value) / 100)}
+                        className="w-full accent-amber-600"
+                      />
+                    )}
+                  </div>
+                ) : (
+                  <label className="flex min-h-[38px] cursor-pointer items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-200 dark:hover:bg-slate-800">
+                    <ImageIcon className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Загрузить изображение карты (PNG / JPG / WebP)</span>
+                    <input
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp"
+                      className="sr-only"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = '';
+                        if (!file) return;
+                        setHistoricErr(null);
+                        const err = await onUploadHistoricMap(file);
+                        if (err) setHistoricErr(err);
+                      }}
+                    />
+                  </label>
+                )}
+
+                {historicErr && <p className="text-xs font-medium text-rose-700 dark:text-rose-400">{historicErr}</p>}
+              </div>
+            )}
+
+            {/* External Bathymetry & Historic Map Quick-Links */}
+            <div className="rounded-2xl border border-slate-200 p-3.5 space-y-2.5 dark:border-slate-800">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-900 dark:text-slate-100">
+                  <Layers className="h-4 w-4 text-sky-700 dark:text-sky-400" aria-hidden="true" />
+                  Внешние карты глубин и русел
+                </h3>
+                {onToggleOpenSeaMap && (
+                  <label className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-slate-700 dark:text-slate-300 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={openSeaMapEnabled}
+                      disabled={!isOnline}
+                      onChange={(e) => onToggleOpenSeaMap(e.target.checked)}
+                      className="h-3.5 w-3.5 accent-sky-700"
+                    />
+                    OpenSeaMap слой
+                  </label>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+                <a
+                  href={`https://activecaptain.garmin.com/en-US/Map?lat=${waterBody.center.lat.toFixed(5)}&lon=${waterBody.center.lng.toFixed(5)}&zoom=13`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-between gap-1 rounded-xl border border-slate-200 px-2.5 py-2 font-semibold text-slate-700 hover:border-sky-500 hover:text-sky-700 dark:border-slate-700 dark:text-slate-200 dark:hover:border-sky-500"
+                >
+                  <span className="truncate">Garmin Quickdraw</span>
+                  <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
+                </a>
+                <a
+                  href={`https://map.openseamap.org/?zoom=13&lat=${waterBody.center.lat.toFixed(5)}&lon=${waterBody.center.lng.toFixed(5)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-between gap-1 rounded-xl border border-slate-200 px-2.5 py-2 font-semibold text-slate-700 hover:border-sky-500 hover:text-sky-700 dark:border-slate-700 dark:text-slate-200 dark:hover:border-sky-500"
+                >
+                  <span className="truncate">OpenSeaMap</span>
+                  <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
+                </a>
+                <a
+                  href="https://www.genesismaps.com/SocialMap"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-between gap-1 rounded-xl border border-slate-200 px-2.5 py-2 font-semibold text-slate-700 hover:border-sky-500 hover:text-sky-700 dark:border-slate-700 dark:text-slate-200 dark:hover:border-sky-500"
+                >
+                  <span className="truncate">C-MAP Genesis</span>
+                  <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
+                </a>
+                <a
+                  href={`https://retromap.ru/?z=13&l=${waterBody.center.lat.toFixed(5)},${waterBody.center.lng.toFixed(5)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-between gap-1 rounded-xl border border-slate-200 px-2.5 py-2 font-semibold text-slate-700 hover:border-amber-500 hover:text-amber-700 dark:border-slate-700 dark:text-slate-200 dark:hover:border-amber-500"
+                >
+                  <span className="truncate">RetroMap (русло)</span>
+                  <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
+                </a>
+              </div>
+            </div>
 
             {/* Unknown Water Body Recon (FR-4) */}
             <div className="rounded-2xl border border-slate-200 p-3.5 space-y-3 dark:border-slate-800">

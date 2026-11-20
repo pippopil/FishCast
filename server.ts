@@ -489,12 +489,99 @@ async function startServer() {
       confidence: source === 'sonar' ? 0.72 : 0.5,
     };
     store.db.bathymetryPoints.push(pt);
-    if (wb.max_depth_m === null || pt.depth_m > wb.max_depth_m) {
-      wb.max_depth_m = pt.depth_m;
-    }
+    wb.has_bathymetry = true;
+    const wbPts = store.db.bathymetryPoints.filter((p) => p.water_body_id === wb.id);
+    wb.max_depth_m = Number(Math.max(...wbPts.map((p) => p.depth_m)).toFixed(1));
+    wb.avg_depth_m = Number((wbPts.reduce((acc, p) => acc + p.depth_m, 0) / wbPts.length).toFixed(1));
     store.persist();
     broadcastEvent({ type: 'depth:new', data: pt, lat: pt.lat, lng: pt.lng });
-    return res.status(201).json({ point: pt });
+    return res.status(201).json({ point: pt, water_body: wb });
+  });
+
+  app.post('/api/v1/water-bodies/:id/depth-points/import', (req, res) => {
+    const rateKey = `depth-import:${req.ip || 'local'}`;
+    if (!store.checkRateLimit(rateKey, 15, 60_000)) {
+      return res.status(429).json({ error: 'Слишком много импортов промеров. Попробуйте через минуту.' });
+    }
+
+    const wb = store.db.waterBodies.find((w) => w.id === req.params.id);
+    if (!wb) return res.status(404).json({ error: 'Водоём не найден.' });
+
+    const rawPoints = Array.isArray(req.body?.points) ? req.body.points : null;
+    if (!rawPoints || rawPoints.length === 0) {
+      return res.status(400).json({ error: 'Передайте непустой массив точек промеров.' });
+    }
+    if (rawPoints.length > 400) {
+      return res.status(400).json({ error: 'За один импорт допускается не более 400 точек.' });
+    }
+
+    const user = getAuthUser(req);
+    const source: BathymetryPoint['source'] = req.body?.source === 'manual' ? 'manual' : 'sonar';
+    const existingKeys = new Set(
+      store.db.bathymetryPoints
+        .filter((p) => p.water_body_id === wb.id)
+        .map((p) => `${p.lat.toFixed(5)}:${p.lng.toFixed(5)}:${p.depth_m.toFixed(1)}`)
+    );
+
+    const created: BathymetryPoint[] = [];
+    const nowIso = new Date().toISOString();
+    let skipped = 0;
+
+    for (const item of rawPoints) {
+      const lat = Number(item?.lat);
+      const lng = Number(item?.lng);
+      const depthM = Number(item?.depth_m);
+      const err = validateDepthPointInput({ lat, lng, depth_m: depthM });
+      if (err) {
+        skipped += 1;
+        continue;
+      }
+      const roundedDepth = Number(depthM.toFixed(1));
+      const key = `${lat.toFixed(5)}:${lng.toFixed(5)}:${roundedDepth.toFixed(1)}`;
+      if (existingKeys.has(key)) {
+        skipped += 1;
+        continue;
+      }
+      existingKeys.add(key);
+
+      const pt: BathymetryPoint = {
+        id: `bp-${crypto.randomUUID().slice(0, 8)}`,
+        water_body_id: wb.id,
+        lat: Number(lat.toFixed(6)),
+        lng: Number(lng.toFixed(6)),
+        depth_m: roundedDepth,
+        source,
+        user_id: user?.id ?? 'guest',
+        created_at: nowIso,
+        confidence: source === 'sonar' ? 0.78 : 0.55,
+      };
+      store.db.bathymetryPoints.push(pt);
+      created.push(pt);
+    }
+
+    if (created.length === 0) {
+      return res.status(400).json({
+        error: skipped > 0 ? 'Все точки уже загружены ранее или содержат некорректные координаты.' : 'Не найдено валидных точек.',
+      });
+    }
+
+    const wbPts = store.db.bathymetryPoints.filter((p) => p.water_body_id === wb.id);
+    wb.has_bathymetry = true;
+    wb.max_depth_m = Number(Math.max(...wbPts.map((p) => p.depth_m)).toFixed(1));
+    wb.avg_depth_m = Number((wbPts.reduce((acc, p) => acc + p.depth_m, 0) / wbPts.length).toFixed(1));
+    store.persist();
+
+    for (const pt of created.slice(0, 12)) {
+      broadcastEvent({ type: 'depth:new', data: pt, lat: pt.lat, lng: pt.lng });
+    }
+
+    return res.status(201).json({
+      imported_count: created.length,
+      skipped_count: skipped,
+      total_points: wbPts.length,
+      points: created,
+      water_body: wb,
+    });
   });
 
   app.get('/api/v1/water-bodies/:id/fish-probability', (req, res) => {

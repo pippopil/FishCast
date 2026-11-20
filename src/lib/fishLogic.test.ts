@@ -4,6 +4,7 @@ import {
   analyzeBarometricWindow,
   analyzeWaterBody,
   buildBiteForecastMetadata,
+  buildSampleSonarCsv,
   buildSplitRouteMetrics,
   computeBiologicalPhase,
   computeFIndexForecast,
@@ -19,7 +20,10 @@ import {
   evaluateFIndexAlerts,
   evaluateForecastAccuracy,
   evaluateGoodBiteWaterBodies,
+  generateBathymetryContours,
   getExpectedFishForWaterBody,
+  getWaterBodyImageBounds,
+  parseSonarDepthFile,
   pointInWaterBody,
   recommendLures,
   selectBestAccessPoint,
@@ -1309,6 +1313,89 @@ test('evaluateForecastAccuracy computes hit rate, Brier score, and catch vs no_b
   assert.ok(adaptiveCal.adaptiveDelta >= 2, `Expected positive adaptiveDelta, got ${adaptiveCal.adaptiveDelta}`);
   assert.ok(adaptiveCal.adaptiveNote?.includes('Адаптация по водоёму'));
 });
+
+test('parseSonarDepthFile parses Deeper/Garmin CSV (comma, semicolon, feet->meters, downsampling)', () => {
+  const sampleCsv = buildSampleSonarCsv(sampleWaterBody);
+  const parsedSample = parseSonarDepthFile(sampleCsv, 'deeper-log.csv');
+  assert.equal(parsedSample.format, 'csv');
+  assert.equal(parsedSample.error, undefined);
+  assert.equal(parsedSample.points.length, 14);
+  assert.equal(parsedSample.skippedCount, 0);
+
+  // Semicolon CSV with feet header and invalid row
+  const feetCsv = [
+    'Latitude;Longitude;Depth_ft',
+    '56,0120;36,8120;10,0',
+    '56,0130;36,8130;20,0',
+    '999;36,8140;15,0',
+    '56,0140;36,8140;0.01',
+  ].join('\n');
+  const parsedFeet = parseSonarDepthFile(feetCsv, 'garmin-ft.csv');
+  assert.equal(parsedFeet.points.length, 2);
+  assert.equal(parsedFeet.skippedCount, 2);
+  assert.ok(Math.abs(parsedFeet.points[0].depth_m - 3.05) < 0.05);
+  assert.ok(Math.abs(parsedFeet.points[1].depth_m - 6.1) < 0.05);
+
+  // Downsampling when > 400 rows
+  const hugeRows = ['lat,lon,depth'];
+  for (let i = 0; i < 480; i++) {
+    hugeRows.push(`${(56.0 + i * 0.0001).toFixed(5)},${(36.8 + i * 0.0001).toFixed(5)},${(2 + (i % 8)).toFixed(1)}`);
+  }
+  const parsedHuge = parseSonarDepthFile(hugeRows.join('\n'), 'huge.csv');
+  assert.equal(parsedHuge.points.length, 400);
+  assert.equal(parsedHuge.downsampled, true);
+});
+
+test('parseSonarDepthFile parses GPX trkpt/wpt depth tags safely', () => {
+  const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+  <gpx version="1.1">
+    <trk><trkseg>
+      <trkpt lat="56.0110" lon="36.8110"><extensions><gpxtpx:TrackPointExtension><gpxtpx:depth>4.2</gpxtpx:depth></gpxtpx:TrackPointExtension></extensions></trkpt>
+      <trkpt lat="56.0120" lon="36.8120"><depth>7.8</depth></trkpt>
+      <trkpt lat="56.0130" lon="36.8130"><ele>-5.5</ele></trkpt>
+      <trkpt lat="56.0140" lon="36.8140"><ele>142.0</ele></trkpt>
+    </trkseg></trk>
+  </gpx>`;
+  const res = parseSonarDepthFile(gpx, 'track.gpx');
+  assert.equal(res.format, 'gpx');
+  assert.equal(res.error, undefined);
+  assert.equal(res.points.length, 3);
+  assert.equal(res.skippedCount, 1);
+  assert.equal(res.points[0].depth_m, 4.2);
+  assert.equal(res.points[1].depth_m, 7.8);
+  assert.equal(res.points[2].depth_m, 5.5);
+});
+
+test('generateBathymetryContours builds valid interpolated isobaths and image bounds', () => {
+  const sampleCsv = buildSampleSonarCsv({ center: { lat: 56.02, lng: 36.83 }, max_depth_m: 10 });
+  const parsed = parseSonarDepthFile(sampleCsv, 'test.csv');
+  const pts: BathymetryPoint[] = parsed.points.map((p, idx) => ({
+    id: `p-${idx}`,
+    water_body_id: 'wb-test',
+    lat: p.lat,
+    lng: p.lng,
+    depth_m: p.depth_m,
+    source: 'sonar',
+    created_at: new Date().toISOString(),
+    confidence: 0.8,
+  }));
+
+  const contours = generateBathymetryContours(pts);
+  assert.ok(contours.length >= 2, `Expected >= 2 contours, got ${contours.length}`);
+  for (const c of contours) {
+    assert.ok(c.depth_m >= 1 && c.depth_m <= 10);
+    assert.ok(c.coordinates.length >= 3);
+  }
+
+  // Fewer than 3 points returns empty contours
+  assert.deepEqual(generateBathymetryContours(pts.slice(0, 2)), []);
+
+  const bounds = getWaterBodyImageBounds(sampleWaterBody);
+  assert.equal(bounds.length, 4);
+  assert.ok(bounds[0][0] < bounds[1][0], 'west < east');
+  assert.ok(bounds[0][1] > bounds[3][1], 'north > south');
+});
+
 
 
 

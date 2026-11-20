@@ -1,4 +1,5 @@
 import type {
+  BathymetryContour,
   BathymetryPoint,
   BiteAlertEvent,
   BiteAlertSettings,
@@ -2466,3 +2467,537 @@ export function buildBathymetryProfile(
     })
     .sort((a, b) => a.distance_m - b.distance_m);
 }
+
+export interface SonarImportPoint {
+  lat: number;
+  lng: number;
+  depth_m: number;
+}
+
+export interface SonarParseResult {
+  points: SonarImportPoint[];
+  format: 'csv' | 'gpx';
+  skippedCount: number;
+  downsampled: boolean;
+  error?: string;
+}
+
+const MAX_SONAR_IMPORT_POINTS = 400;
+
+function parseLocalizedNumber(raw: string): number {
+  const cleaned = raw.trim().replace(/^["']|["']$/g, '').replace(/\s+/g, '');
+  if (!cleaned) return Number.NaN;
+  const normalized = cleaned.includes(',') && !cleaned.includes('.') ? cleaned.replace(',', '.') : cleaned;
+  return Number(normalized);
+}
+
+function downsampleSonarPoints(points: SonarImportPoint[], maxCount: number): {
+  points: SonarImportPoint[];
+  downsampled: boolean;
+} {
+  if (points.length <= maxCount) return { points, downsampled: false };
+  const step = (points.length - 1) / (maxCount - 1);
+  const sampled: SonarImportPoint[] = [];
+  for (let i = 0; i < maxCount - 1; i++) {
+    sampled.push(points[Math.round(i * step)]);
+  }
+  sampled.push(points[points.length - 1]);
+  return { points: sampled, downsampled: true };
+}
+
+/**
+ * Safely parses sonar depth logs from Deeper, Garmin ActiveCaptain/Quickdraw, Lowrance/Humminbird CSV
+ * or GPX (<trkpt>/<wpt>/<rtept> with <depth>/<gpxtpx:depth>/<waterdepth>/negative <ele>).
+ * Pure string/regex parser (avoids XML DOM/XXE risks) with strict coordinate & depth validation.
+ */
+export function parseSonarDepthFile(content: string, filename = ''): SonarParseResult {
+  const trimmed = content.replace(/^\uFEFF/, '').trim();
+  const lowerName = filename.toLowerCase();
+  const isGpx =
+    lowerName.endsWith('.gpx') ||
+    /^<\?xml/i.test(trimmed) ||
+    /<gpx[\s>]/i.test(trimmed) ||
+    /<(trkpt|wpt|rtept)\b/i.test(trimmed);
+
+  if (!trimmed) {
+    return { points: [], format: isGpx ? 'gpx' : 'csv', skippedCount: 0, downsampled: false, error: 'Файл пустой.' };
+  }
+
+  const rawPoints: SonarImportPoint[] = [];
+  let skippedCount = 0;
+
+  if (isGpx) {
+    const pointTagRe = /<(trkpt|wpt|rtept)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = pointTagRe.exec(trimmed)) !== null) {
+      const attrs = match[2];
+      const body = match[3];
+      const latMatch = /\blat\s*=\s*["']([^"']+)["']/i.exec(attrs);
+      const lonMatch = /\blon\s*=\s*["']([^"']+)["']/i.exec(attrs);
+      if (!latMatch || !lonMatch) {
+        skippedCount += 1;
+        continue;
+      }
+      const lat = parseLocalizedNumber(latMatch[1]);
+      const lng = parseLocalizedNumber(lonMatch[1]);
+
+      const depthTag =
+        /<(?:[a-z0-9_-]+:)?(?:depth|waterdepth|dpt)\b[^>]*>([^<]+)<\/(?:[a-z0-9_-]+:)?(?:depth|waterdepth|dpt)>/i.exec(
+          body
+        );
+      let depthMeters = Number.NaN;
+      if (depthTag) {
+        depthMeters = Math.abs(parseLocalizedNumber(depthTag[1]));
+      } else {
+        const eleTag = /<ele\b[^>]*>([^<]+)<\/ele>/i.exec(body);
+        if (eleTag) {
+          const eleVal = parseLocalizedNumber(eleTag[1]);
+          if (Number.isFinite(eleVal) && eleVal < 0) {
+            depthMeters = Math.abs(eleVal);
+          }
+        }
+      }
+
+      if (
+        !Number.isFinite(lat) ||
+        !Number.isFinite(lng) ||
+        !Number.isFinite(depthMeters) ||
+        lat < -90 ||
+        lat > 90 ||
+        lng < -180 ||
+        lng > 180 ||
+        depthMeters < 0.1 ||
+        depthMeters > 120
+      ) {
+        skippedCount += 1;
+        continue;
+      }
+
+      rawPoints.push({
+        lat: Number(lat.toFixed(6)),
+        lng: Number(lng.toFixed(6)),
+        depth_m: Number(depthMeters.toFixed(2)),
+      });
+    }
+
+    if (rawPoints.length === 0) {
+      return {
+        points: [],
+        format: 'gpx',
+        skippedCount,
+        downsampled: false,
+        error: 'В GPX не найдено точек с тегом глубины (<depth> / <gpxtpx:depth> или отрицательным <ele>).',
+      };
+    }
+
+    const { points, downsampled } = downsampleSonarPoints(rawPoints, MAX_SONAR_IMPORT_POINTS);
+    return { points, format: 'gpx', skippedCount, downsampled };
+  }
+
+  // CSV / TXT sonar log parser (Deeper, Garmin, Lowrance, Humminbird, generic)
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith('#'));
+
+  if (lines.length === 0) {
+    return { points: [], format: 'csv', skippedCount: 0, downsampled: false, error: 'Файл не содержит строк данных.' };
+  }
+
+  const sampleLine = lines[0];
+  const semiCount = (sampleLine.match(/;/g) || []).length;
+  const tabCount = (sampleLine.match(/\t/g) || []).length;
+  const commaCount = (sampleLine.match(/,/g) || []).length;
+  const delimiter = tabCount >= 2 ? '\t' : semiCount >= 2 && semiCount >= commaCount ? ';' : ',';
+
+  const firstCells = sampleLine
+    .split(delimiter)
+    .map((c) => c.trim().replace(/^["']|["']$/g, '').toLowerCase());
+
+  const hasHeader = firstCells.some((c) => /[a-zа-яё]/i.test(c));
+  let latIdx = 0;
+  let lngIdx = 1;
+  let depthIdx = 2;
+  let depthInFeet = false;
+
+  if (hasHeader) {
+    const foundLat = firstCells.findIndex((c) => /^(lat|latitude|широта|y)$/i.test(c) || c.includes('lat') || c.includes('широт'));
+    const foundLng = firstCells.findIndex(
+      (c) => /^(lon|lng|long|longitude|долгота|x)$/i.test(c) || c.includes('lon') || c.includes('lng') || c.includes('долгот')
+    );
+    const foundDepth = firstCells.findIndex(
+      (c) =>
+        /^(depth|depth_m|depth_ft|dpt|глубина|depth\(m\)|depth\(ft\)|z)$/i.test(c) ||
+        c.includes('depth') ||
+        c.includes('глубин')
+    );
+    if (foundLat >= 0) latIdx = foundLat;
+    if (foundLng >= 0) lngIdx = foundLng;
+    if (foundDepth >= 0) {
+      depthIdx = foundDepth;
+      const headerCell = firstCells[foundDepth];
+      if (/\bft\b|feet|фут|_ft|\(ft\)/i.test(headerCell)) {
+        depthInFeet = true;
+      }
+    }
+  }
+
+  const startIdx = hasHeader ? 1 : 0;
+  for (let i = startIdx; i < lines.length; i++) {
+    const cells = lines[i].split(delimiter);
+    if (cells.length <= Math.max(latIdx, lngIdx, depthIdx)) {
+      skippedCount += 1;
+      continue;
+    }
+    const lat = parseLocalizedNumber(cells[latIdx]);
+    const lng = parseLocalizedNumber(cells[lngIdx]);
+    const rawDepth = parseLocalizedNumber(cells[depthIdx]);
+    const depthMeters = depthInFeet ? Math.abs(rawDepth) * 0.3048 : Math.abs(rawDepth);
+
+    if (
+      !Number.isFinite(lat) ||
+      !Number.isFinite(lng) ||
+      !Number.isFinite(depthMeters) ||
+      lat < -90 ||
+      lat > 90 ||
+      lng < -180 ||
+      lng > 180 ||
+      depthMeters < 0.1 ||
+      depthMeters > 120
+    ) {
+      skippedCount += 1;
+      continue;
+    }
+
+    rawPoints.push({
+      lat: Number(lat.toFixed(6)),
+      lng: Number(lng.toFixed(6)),
+      depth_m: Number(depthMeters.toFixed(2)),
+    });
+  }
+
+  if (rawPoints.length === 0) {
+    return {
+      points: [],
+      format: 'csv',
+      skippedCount,
+      downsampled: false,
+      error: 'Не удалось распознать координаты и глубины. Ожидаются колонки Latitude, Longitude, Depth (в метрах или футах).',
+    };
+  }
+
+  const { points, downsampled } = downsampleSonarPoints(rawPoints, MAX_SONAR_IMPORT_POINTS);
+  return { points, format: 'csv', skippedCount, downsampled };
+}
+
+export function buildSampleSonarCsv(waterBody: Pick<WaterBody, 'center' | 'max_depth_m'>): string {
+  const baseLat = waterBody.center.lat;
+  const baseLng = waterBody.center.lng;
+  const peak = Math.max(4.5, Math.min(18, waterBody.max_depth_m ?? 8.5));
+  const offsets: Array<[number, number, number]> = [
+    [-0.0022, -0.0024, 0.25],
+    [-0.0014, -0.0018, 0.45],
+    [-0.0006, -0.0011, 0.72],
+    [0.0, -0.0004, 0.94],
+    [0.0007, 0.0003, 1.0],
+    [0.0015, 0.001, 0.78],
+    [0.0022, 0.0018, 0.35],
+    [-0.0018, 0.0014, 0.32],
+    [-0.0009, 0.0009, 0.64],
+    [0.0002, 0.0012, 0.82],
+    [0.0012, -0.0014, 0.56],
+    [0.0019, -0.002, 0.28],
+    [-0.0004, -0.0021, 0.4],
+    [0.0005, 0.0022, 0.38],
+  ];
+  const header = 'Latitude,Longitude,Depth_m';
+  const rows = offsets.map(([dLat, dLng, frac]) => {
+    const lat = (baseLat + dLat).toFixed(6);
+    const lng = (baseLng + dLng).toFixed(6);
+    const depth = Math.max(0.8, Number((peak * frac).toFixed(1)));
+    return `${lat},${lng},${depth}`;
+  });
+  return [header, ...rows].join('\n');
+}
+
+export function getWaterBodyImageBounds(
+  wb: Pick<WaterBody, 'polygon' | 'center'>
+): [[number, number], [number, number], [number, number], [number, number]] {
+  let west = wb.center.lng - 0.014;
+  let east = wb.center.lng + 0.014;
+  let south = wb.center.lat - 0.009;
+  let north = wb.center.lat + 0.009;
+
+  if (wb.polygon && wb.polygon.length >= 3) {
+    let minLng = Infinity;
+    let maxLng = -Infinity;
+    let minLat = Infinity;
+    let maxLat = -Infinity;
+    for (const [lng, lat] of wb.polygon) {
+      if (lng < minLng) minLng = lng;
+      if (lng > maxLng) maxLng = lng;
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+    }
+    if (Number.isFinite(minLng) && Number.isFinite(maxLng) && Number.isFinite(minLat) && Number.isFinite(maxLat)) {
+      const padLng = Math.max(0.0015, (maxLng - minLng) * 0.12);
+      const padLat = Math.max(0.001, (maxLat - minLat) * 0.12);
+      west = minLng - padLng;
+      east = maxLng + padLng;
+      south = minLat - padLat;
+      north = maxLat + padLat;
+    }
+  }
+
+  return [
+    [Number(west.toFixed(6)), Number(north.toFixed(6))], // top-left
+    [Number(east.toFixed(6)), Number(north.toFixed(6))], // top-right
+    [Number(east.toFixed(6)), Number(south.toFixed(6))], // bottom-right
+    [Number(west.toFixed(6)), Number(south.toFixed(6))], // bottom-left
+  ];
+}
+
+/**
+ * Generates smooth interpolated bathymetry contours (isobaths) from sparse or dense depth readings
+ * using Inverse Distance Weighting (IDW) + Marching Squares contour extraction and polyline stitching.
+ */
+export function generateBathymetryContours(
+  points: BathymetryPoint[],
+  waterBody?: Pick<WaterBody, 'polygon' | 'polygon_rings'> | null
+): BathymetryContour[] {
+  if (!points || points.length < 3) return [];
+
+  let minDepth = Infinity;
+  let maxDepth = -Infinity;
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  let minLng = Infinity;
+  let maxLng = -Infinity;
+
+  for (const p of points) {
+    if (!Number.isFinite(p.lat) || !Number.isFinite(p.lng) || !Number.isFinite(p.depth_m)) continue;
+    if (p.depth_m < minDepth) minDepth = p.depth_m;
+    if (p.depth_m > maxDepth) maxDepth = p.depth_m;
+    if (p.lat < minLat) minLat = p.lat;
+    if (p.lat > maxLat) maxLat = p.lat;
+    if (p.lng < minLng) minLng = p.lng;
+    if (p.lng > maxLng) maxLng = p.lng;
+  }
+
+  if (!Number.isFinite(minDepth) || maxDepth - minDepth < 0.4) return [];
+
+  const latSpan = Math.max(0.0025, maxLat - minLat);
+  const lngSpan = Math.max(0.0035, maxLng - minLng);
+  minLat -= latSpan * 0.28;
+  maxLat += latSpan * 0.28;
+  minLng -= lngSpan * 0.28;
+  maxLng += lngSpan * 0.28;
+
+  const hasPolygon = Boolean(waterBody && waterBody.polygon && waterBody.polygon.length >= 3);
+  const cols = 22;
+  const rows = 22;
+  const dLng = (maxLng - minLng) / (cols - 1);
+  const dLat = (maxLat - minLat) / (rows - 1);
+
+  // Build IDW depth grid with soft shoreline anchoring outside the water polygon (if available)
+  const grid: number[][] = Array.from({ length: rows }, () => new Array<number>(cols).fill(0.15));
+  const cosLat = Math.cos((((minLat + maxLat) / 2) * Math.PI) / 180) || 1;
+  const boundaryRadiusSq = Math.pow(Math.max(latSpan, lngSpan * cosLat) * 0.72, 2);
+
+  for (let r = 0; r < rows; r++) {
+    const lat = minLat + r * dLat;
+    for (let c = 0; c < cols; c++) {
+      const lng = minLng + c * dLng;
+      if (hasPolygon && waterBody && !pointInWaterBody({ lat, lng }, waterBody)) {
+        grid[r][c] = 0.15;
+        continue;
+      }
+
+      // Fade smoothly toward 0.2m at the outer perimeter when no polygon is present so isobaths close cleanly
+      const edgeDist = Math.min(r, rows - 1 - r, c, cols - 1 - c);
+      if (!hasPolygon && edgeDist === 0) {
+        grid[r][c] = 0.2;
+        continue;
+      }
+
+      let wSum = 0;
+      let vSum = 0;
+      let exact: number | null = null;
+      let nearestDistSq = Infinity;
+
+      for (let i = 0; i < points.length; i++) {
+        const pt = points[i];
+        const dy = lat - pt.lat;
+        const dx = (lng - pt.lng) * cosLat;
+        const distSq = dx * dx + dy * dy;
+        if (distSq < 1e-12) {
+          exact = pt.depth_m;
+          break;
+        }
+        if (distSq < nearestDistSq) nearestDistSq = distSq;
+        const w = 1 / distSq;
+        wSum += w;
+        vSum += w * pt.depth_m;
+      }
+
+      if (exact !== null) {
+        grid[r][c] = exact;
+      } else {
+        // Blend weakly toward shallow baseline if far from any reading
+        const rawVal = wSum > 0 ? vSum / wSum : 0.2;
+        const farFactor = Math.min(1, nearestDistSq / Math.max(1e-8, boundaryRadiusSq));
+        grid[r][c] = rawVal * (1 - 0.55 * farFactor) + 0.2 * (0.55 * farFactor);
+      }
+    }
+  }
+
+  // Choose 3..5 clean contour levels between minDepth and maxDepth
+  const span = maxDepth - Math.min(minDepth, 0.5);
+  const step = span <= 3 ? 0.5 : span <= 6 ? 1 : span <= 12 ? 2 : span <= 24 ? 3 : 5;
+  const levels: number[] = [];
+  const startLevel = Math.max(step, Math.ceil((Math.min(minDepth, 1.0) + step * 0.25) / step) * step);
+  for (let lv = startLevel; lv <= maxDepth - step * 0.15; lv += step) {
+    levels.push(Number(lv.toFixed(1)));
+    if (levels.length >= 6) break;
+  }
+  if (levels.length === 0) {
+    levels.push(Number(((minDepth + maxDepth) / 2).toFixed(1)));
+  }
+
+  const interp = (v1: number, v2: number, level: number): number => {
+    const denom = v2 - v1;
+    if (Math.abs(denom) < 1e-9) return 0.5;
+    return Math.max(0, Math.min(1, (level - v1) / denom));
+  };
+
+  type Seg = [[number, number], [number, number]];
+  const contours: BathymetryContour[] = [];
+
+  for (const level of levels) {
+    const segments: Seg[] = [];
+
+    for (let r = 0; r < rows - 1; r++) {
+      const lat0 = minLat + r * dLat;
+      const lat1 = lat0 + dLat;
+      for (let c = 0; c < cols - 1; c++) {
+        const lng0 = minLng + c * dLng;
+        const lng1 = lng0 + dLng;
+
+        const bl = grid[r][c];
+        const br = grid[r][c + 1];
+        const tr = grid[r + 1][c + 1];
+        const tl = grid[r + 1][c];
+
+        const mask =
+          (bl >= level ? 1 : 0) |
+          (br >= level ? 2 : 0) |
+          (tr >= level ? 4 : 0) |
+          (tl >= level ? 8 : 0);
+
+        if (mask === 0 || mask === 15) continue;
+
+        const bottom: [number, number] = [lng0 + interp(bl, br, level) * dLng, lat0];
+        const right: [number, number] = [lng1, lat0 + interp(br, tr, level) * dLat];
+        const top: [number, number] = [lng0 + interp(tl, tr, level) * dLng, lat1];
+        const left: [number, number] = [lng0, lat0 + interp(bl, tl, level) * dLat];
+
+        switch (mask) {
+          case 1:
+          case 14:
+            segments.push([left, bottom]);
+            break;
+          case 2:
+          case 13:
+            segments.push([bottom, right]);
+            break;
+          case 3:
+          case 12:
+            segments.push([left, right]);
+            break;
+          case 4:
+          case 11:
+            segments.push([top, right]);
+            break;
+          case 5: {
+            const center = (bl + br + tr + tl) / 4;
+            if (center >= level) {
+              segments.push([left, top], [bottom, right]);
+            } else {
+              segments.push([left, bottom], [top, right]);
+            }
+            break;
+          }
+          case 6:
+          case 9:
+            segments.push([bottom, top]);
+            break;
+          case 7:
+          case 8:
+            segments.push([left, top]);
+            break;
+          case 10: {
+            const center = (bl + br + tr + tl) / 4;
+            if (center >= level) {
+              segments.push([left, bottom], [top, right]);
+            } else {
+              segments.push([left, top], [bottom, right]);
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    if (segments.length === 0) continue;
+
+    // Stitch segments into connected polylines
+    const keyOf = (pt: [number, number]) => `${Math.round(pt[0] * 1e5)},${Math.round(pt[1] * 1e5)}`;
+    const used = new Array<boolean>(segments.length).fill(false);
+
+    for (let i = 0; i < segments.length; i++) {
+      if (used[i]) continue;
+      used[i] = true;
+      const line: [number, number][] = [segments[i][0], segments[i][1]];
+
+      let extended = true;
+      while (extended) {
+        extended = false;
+        const headKey = keyOf(line[0]);
+        const tailKey = keyOf(line[line.length - 1]);
+        for (let j = 0; j < segments.length; j++) {
+          if (used[j]) continue;
+          const [a, b] = segments[j];
+          const aKey = keyOf(a);
+          const bKey = keyOf(b);
+          if (aKey === tailKey) {
+            line.push(b);
+            used[j] = true;
+            extended = true;
+          } else if (bKey === tailKey) {
+            line.push(a);
+            used[j] = true;
+            extended = true;
+          } else if (bKey === headKey) {
+            line.unshift(a);
+            used[j] = true;
+            extended = true;
+          } else if (aKey === headKey) {
+            line.unshift(b);
+            used[j] = true;
+            extended = true;
+          }
+        }
+      }
+
+      if (line.length >= 3) {
+        contours.push({
+          depth_m: level,
+          coordinates: line.map(([lng, lat]) => [Number(lng.toFixed(6)), Number(lat.toFixed(6))]),
+        });
+      }
+    }
+  }
+
+  return contours;
+}
+

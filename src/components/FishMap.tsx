@@ -16,7 +16,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { haversineMeters } from '../lib/fishLogic';
+import { generateBathymetryContours, haversineMeters } from '../lib/fishLogic';
 import {
   bboxToPolygonRing,
   estimateRegionTileCount,
@@ -101,11 +101,21 @@ function ensureOfflineTileProtocol() {
   });
 }
 
+export interface HistoricMapOverlay {
+  waterBodyId: string;
+  fileName: string;
+  imageUrl: string;
+  bounds: [[number, number], [number, number], [number, number], [number, number]];
+}
+
 export interface MapLayerToggles {
   baseStyle: 'scheme' | 'satellite';
   contours: boolean;
   heatmap: boolean;
   prospective: boolean;
+  openSeaMap: boolean;
+  topoOverlay: boolean;
+  historicOpacity: number;
 }
 
 interface FishMapProps {
@@ -118,6 +128,7 @@ interface FishMapProps {
   activeRoute: RouteMultiResult | null;
   layers: MapLayerToggles;
   onToggleLayers: (next: MapLayerToggles) => void;
+  historicOverlay?: HistoricMapOverlay | null;
   userOrigin: LatLng;
   onLocateUser?: () => void;
   onPickCoordinate?: (coords: LatLng) => void;
@@ -152,6 +163,20 @@ function buildHydroStyle(baseStyle: 'scheme' | 'satellite'): maplibregl.StyleSpe
         tileSize: 256,
         attribution: '© OpenStreetMap · © Seascape (openwaters.io)',
       },
+      opentopo: {
+        type: 'raster',
+        tiles: ['https://tile.opentopomap.org/{z}/{x}/{y}.png'],
+        tileSize: 256,
+        maxzoom: 17,
+        attribution: '© OpenTopoMap (CC-BY-SA)',
+      },
+      openseamap: {
+        type: 'raster',
+        tiles: ['https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png'],
+        tileSize: 256,
+        maxzoom: 18,
+        attribution: '© OpenSeaMap',
+      },
     },
     layers: [
       {
@@ -171,6 +196,24 @@ function buildHydroStyle(baseStyle: 'scheme' | 'satellite'): maplibregl.StyleSpe
           'raster-brightness-max': isSat ? 0.55 : 1.0,
         },
       },
+      {
+        id: 'opentopo-tiles',
+        type: 'raster',
+        source: 'opentopo',
+        layout: { visibility: 'none' },
+        paint: {
+          'raster-opacity': 0.58,
+        },
+      },
+      {
+        id: 'openseamap-tiles',
+        type: 'raster',
+        source: 'openseamap',
+        layout: { visibility: 'none' },
+        paint: {
+          'raster-opacity': 0.92,
+        },
+      },
     ],
   };
 }
@@ -185,6 +228,7 @@ export const FishMap: React.FC<FishMapProps> = ({
   activeRoute,
   layers,
   onToggleLayers,
+  historicOverlay = null,
   userOrigin,
   onLocateUser,
   onPickCoordinate,
@@ -331,23 +375,31 @@ export const FishMap: React.FC<FishMapProps> = ({
     };
   }, [waterBodies, selectedWaterBody?.id]);
 
+  const activeContours = useMemo(() => {
+    const staticContours = selectedWaterBody?.contours ?? [];
+    const sonarOrManualCount = depthPoints.filter((p) => p.source === 'sonar' || p.source === 'manual').length;
+    if (depthPoints.length >= 3 && (staticContours.length === 0 || sonarOrManualCount >= 3)) {
+      const generated = generateBathymetryContours(depthPoints, selectedWaterBody);
+      if (generated.length > 0) return generated;
+    }
+    return staticContours;
+  }, [selectedWaterBody, depthPoints]);
+
   const contoursGeoJson = useMemo(() => {
     const features: Array<{
       type: 'Feature';
       properties: { depth_m: number; label: string };
       geometry: { type: 'LineString'; coordinates: [number, number][] };
     }> = [];
-    if (selectedWaterBody?.contours) {
-      for (const c of selectedWaterBody.contours) {
-        features.push({
-          type: 'Feature',
-          properties: { depth_m: c.depth_m, label: `${c.depth_m} м` },
-          geometry: { type: 'LineString', coordinates: c.coordinates },
-        });
-      }
+    for (const c of activeContours) {
+      features.push({
+        type: 'Feature',
+        properties: { depth_m: c.depth_m, label: `${c.depth_m} м` },
+        geometry: { type: 'LineString', coordinates: c.coordinates },
+      });
     }
     return { type: 'FeatureCollection' as const, features };
-  }, [selectedWaterBody]);
+  }, [activeContours]);
 
   const depthPointsGeoJson = useMemo(() => {
     return {
@@ -553,8 +605,18 @@ export const FishMap: React.FC<FishMapProps> = ({
           type: 'line',
           source: 'bathymetry-contours',
           paint: {
-            'line-color': '#075985',
-            'line-width': 1.6,
+            'line-color': [
+              'interpolate',
+              ['linear'],
+              ['get', 'depth_m'],
+              1,
+              '#0284C7',
+              5,
+              '#0369A1',
+              10,
+              '#1E3A8A',
+            ],
+            'line-width': 1.8,
             'line-dasharray': [2, 1],
           },
         });
@@ -822,15 +884,95 @@ export const FishMap: React.FC<FishMapProps> = ({
     setVis('contours-line', layers.contours);
     setVis('bathymetry-heatmap', layers.heatmap);
     setVis('prospective-circles', layers.prospective);
-  }, [mapReady, layers]);
+    setVis('openseamap-tiles', layers.openSeaMap && isOnline);
+    setVis('opentopo-tiles', layers.topoOverlay && isOnline);
+  }, [mapReady, layers, isOnline]);
 
-  // Crisp DOM Markers for depth readings, prospective drop-offs/holes, and route parking pins
+  // User-uploaded historic / pre-flood riverbed map image overlay
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const sourceId = 'historic-map-source';
+    const layerId = 'historic-map-layer';
+
+    if (map.getLayer(layerId)) map.removeLayer(layerId);
+    if (map.getSource(sourceId)) map.removeSource(sourceId);
+
+    if (
+      historicOverlay &&
+      selectedWaterBody &&
+      historicOverlay.waterBodyId === selectedWaterBody.id &&
+      historicOverlay.imageUrl.startsWith('data:image/')
+    ) {
+      map.addSource(sourceId, {
+        type: 'image',
+        url: historicOverlay.imageUrl,
+        coordinates: historicOverlay.bounds,
+      });
+      const beforeId = map.getLayer('water-bodies-outline') ? 'water-bodies-outline' : undefined;
+      map.addLayer(
+        {
+          id: layerId,
+          type: 'raster',
+          source: sourceId,
+          paint: {
+            'raster-opacity': Math.max(0.05, Math.min(1, layers.historicOpacity)),
+            'raster-fade-duration': 0,
+          },
+        },
+        beforeId
+      );
+    }
+
+    return () => {
+      if (!mapRef.current) return;
+      try {
+        if (map.getLayer(layerId)) map.removeLayer(layerId);
+        if (map.getSource(sourceId)) map.removeSource(sourceId);
+      } catch {
+        // Ignore cleanup errors when map is unmounting
+      }
+    };
+  }, [mapReady, historicOverlay, selectedWaterBody?.id]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    if (map.getLayer('historic-map-layer')) {
+      map.setPaintProperty(
+        'historic-map-layer',
+        'raster-opacity',
+        Math.max(0.05, Math.min(1, layers.historicOpacity))
+      );
+    }
+  }, [mapReady, layers.historicOpacity]);
+
+  // Crisp DOM Markers for isobath depth badges, prospective drop-offs/holes, and route parking pins
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
 
     for (const m of markersRef.current) m.remove();
     markersRef.current = [];
+
+    if (layers.contours && activeContours.length > 0) {
+      const labeledDepths = new Set<number>();
+      for (const contour of activeContours) {
+        if (labeledDepths.size >= 5) break;
+        if (labeledDepths.has(contour.depth_m) || contour.coordinates.length < 2) continue;
+        labeledDepths.add(contour.depth_m);
+        const mid = contour.coordinates[Math.floor(contour.coordinates.length / 2)];
+        const el = document.createElement('div');
+        el.className =
+          'rounded bg-sky-900/85 px-1 py-0.5 text-[9px] font-mono font-bold text-white shadow-xs pointer-events-none';
+        el.textContent = `${contour.depth_m}м`;
+        markersRef.current.push(
+          new maplibregl.Marker({ element: el, anchor: 'center' })
+            .setLngLat([mid[0], mid[1]])
+            .addTo(map)
+        );
+      }
+    }
 
     if (layers.prospective) {
       for (const z of prospectiveZones.slice(0, 5)) {
@@ -857,7 +999,7 @@ export const FishMap: React.FC<FishMapProps> = ({
           .addTo(map)
       );
     }
-  }, [mapReady, prospectiveZones, activeRoute, layers.prospective]);
+  }, [mapReady, prospectiveZones, activeRoute, layers.prospective, layers.contours, activeContours]);
 
   // Update base map style when scheme/satellite changes
   useEffect(() => {
@@ -1095,6 +1237,55 @@ export const FishMap: React.FC<FishMapProps> = ({
                   className="h-4 w-4 accent-sky-700"
                 />
               </label>
+
+              <div className="border-t border-slate-100 pt-2 dark:border-slate-800 space-y-2">
+                <div className="text-[11px] font-bold text-slate-500 dark:text-slate-400">
+                  Внешние слои (онлайн)
+                </div>
+                <label className="flex items-center justify-between gap-2 cursor-pointer">
+                  <span>OpenSeaMap (фарватер / знаки)</span>
+                  <input
+                    type="checkbox"
+                    checked={layers.openSeaMap}
+                    disabled={!isOnline}
+                    onChange={(e) => onToggleLayers({ ...layers, openSeaMap: e.target.checked })}
+                    className="h-4 w-4 accent-sky-700 disabled:opacity-40"
+                  />
+                </label>
+                <label className="flex items-center justify-between gap-2 cursor-pointer">
+                  <span>Топо-рельеф (OpenTopoMap)</span>
+                  <input
+                    type="checkbox"
+                    checked={layers.topoOverlay}
+                    disabled={!isOnline}
+                    onChange={(e) => onToggleLayers({ ...layers, topoOverlay: e.target.checked })}
+                    className="h-4 w-4 accent-sky-700 disabled:opacity-40"
+                  />
+                </label>
+              </div>
+
+              {historicOverlay && selectedWaterBody?.id === historicOverlay.waterBodyId && (
+                <div className="border-t border-slate-100 pt-2 dark:border-slate-800 space-y-1">
+                  <div className="flex items-center justify-between text-[11px] font-semibold text-amber-800 dark:text-amber-300">
+                    <span>Старая карта русла</span>
+                    <span className="font-mono">{Math.round(layers.historicOpacity * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={10}
+                    max={100}
+                    step={5}
+                    value={Math.round(layers.historicOpacity * 100)}
+                    onChange={(e) =>
+                      onToggleLayers({
+                        ...layers,
+                        historicOpacity: Number(e.target.value) / 100,
+                      })
+                    }
+                    className="w-full accent-amber-600"
+                  />
+                </div>
+              )}
             </div>
           </div>
         )}

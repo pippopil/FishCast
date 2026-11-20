@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronUp, Filter, Search, WifiOff } from 'lucide-react';
-import { FishMap, type MapLayerToggles } from './components/FishMap';
+import { FishMap, type HistoricMapOverlay, type MapLayerToggles } from './components/FishMap';
 import { TopNav, type AppTab } from './components/TopNav';
 import { WaterBodySheet } from './components/WaterBodySheet';
 import { WaterBodiesDirectory } from './components/WaterBodiesDirectory';
@@ -20,10 +20,12 @@ import {
   detectProspectiveZones,
   evaluateFIndexAlerts,
   evaluateGoodBiteWaterBodies,
+  getWaterBodyImageBounds,
   haversineMeters,
   recommendLures,
   validateCatchReportInput,
   validateDepthPointInput,
+  type SonarImportPoint,
 } from './lib/fishLogic';
 import {
   getNotificationPermissionState,
@@ -136,7 +138,11 @@ export default function App() {
     contours: true,
     heatmap: true,
     prospective: true,
+    openSeaMap: false,
+    topoOverlay: false,
+    historicOpacity: 0.55,
   });
+  const [historicOverlay, setHistoricOverlay] = useState<HistoricMapOverlay | null>(null);
   const [pickDepthMode, setPickDepthMode] = useState(false);
   const [pickedCoords, setPickedCoords] = useState<LatLng | null>(null);
   const [quickMarkOpen, setQuickMarkOpen] = useState(false);
@@ -985,16 +991,127 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const json = (await res.json()) as { point?: BathymetryPoint; error?: string };
+      const json = (await res.json()) as { point?: BathymetryPoint; water_body?: WaterBody; error?: string };
       if (!res.ok) return json.error ?? 'Не удалось сохранить глубину.';
       if (json.point) {
         handleIncomingDepthPoint(json.point);
+      }
+      if (json.water_body) {
+        const updatedWb = json.water_body;
+        setSelectedWaterBody((prev) => (prev?.id === updatedWb.id ? { ...prev, ...updatedWb } : prev));
+        setWaterBodies((prev) => prev.map((w) => (w.id === updatedWb.id ? { ...w, ...updatedWb } : w)));
       }
       setPickDepthMode(false);
       return null;
     } catch {
       return 'Ошибка сети при сохранении точки глубины.';
     }
+  };
+
+  const handleImportDepthPoints = async (
+    points: SonarImportPoint[]
+  ): Promise<{ importedCount: number; error?: string }> => {
+    if (!selectedWaterBody) return { importedCount: 0, error: 'Сначала выберите водоём.' };
+    if (points.length === 0) return { importedCount: 0, error: 'Нет точек для импорта.' };
+
+    const applyLocalFallback = () => {
+      const nowIso = new Date().toISOString();
+      const localPts: BathymetryPoint[] = points.map((p, idx) => ({
+        id: `bp-local-${Date.now()}-${idx}`,
+        water_body_id: selectedWaterBody.id,
+        lat: p.lat,
+        lng: p.lng,
+        depth_m: Number(p.depth_m.toFixed(1)),
+        source: 'sonar',
+        user_id: user?.id ?? 'guest',
+        created_at: nowIso,
+        confidence: 0.78,
+      }));
+      setDepthPoints((prev) => {
+        const next = [...prev, ...localPts];
+        const maxD = Number(Math.max(...next.map((x) => x.depth_m)).toFixed(1));
+        const avgD = Number((next.reduce((acc, x) => acc + x.depth_m, 0) / next.length).toFixed(1));
+        setSelectedWaterBody((wb) =>
+          wb && wb.id === selectedWaterBody.id
+            ? { ...wb, has_bathymetry: true, max_depth_m: maxD, avg_depth_m: avgD }
+            : wb
+        );
+        return next;
+      });
+      setLayers((prev) => ({ ...prev, contours: true }));
+      showToast(`Локально импортировано ${localPts.length} промеров эхолота — изобаты обновлены.`);
+      return { importedCount: localPts.length };
+    };
+
+    if (!isOnline) {
+      return applyLocalFallback();
+    }
+
+    try {
+      const res = await fetch(apiUrl(`/api/v1/water-bodies/${selectedWaterBody.id}/depth-points/import`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ points, source: 'sonar' }),
+      });
+      const json = (await res.json()) as {
+        imported_count?: number;
+        points?: BathymetryPoint[];
+        water_body?: WaterBody;
+        error?: string;
+      };
+      if (!res.ok) {
+        return { importedCount: 0, error: json.error ?? 'Не удалось импортировать промеры.' };
+      }
+      if (json.points && json.points.length > 0) {
+        setDepthPoints((prev) => {
+          const existingIds = new Set(prev.map((p) => p.id));
+          const added = json.points!.filter((p) => !existingIds.has(p.id));
+          return [...prev, ...added];
+        });
+      }
+      if (json.water_body) {
+        const updatedWb = json.water_body;
+        setSelectedWaterBody((prev) => (prev?.id === updatedWb.id ? { ...prev, ...updatedWb } : prev));
+        setWaterBodies((prev) => prev.map((w) => (w.id === updatedWb.id ? { ...w, ...updatedWb } : w)));
+      }
+      setLayers((prev) => ({ ...prev, contours: true }));
+      const count = json.imported_count ?? json.points?.length ?? points.length;
+      showToast(`Импортировано ${count} промеров эхолота — изобаты построены автоматически.`);
+      return { importedCount: count };
+    } catch {
+      return applyLocalFallback();
+    }
+  };
+
+  const handleUploadHistoricMap = async (file: File): Promise<string | null> => {
+    if (!selectedWaterBody) return 'Сначала выберите водоём.';
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+      return 'Допустимые форматы: PNG, JPG, WebP.';
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      return 'Размер изображения превышает лимит 5 МБ.';
+    }
+
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = typeof reader.result === 'string' ? reader.result : '';
+        if (!result.startsWith('data:image/')) {
+          resolve('Не удалось прочитать изображение карты.');
+          return;
+        }
+        setHistoricOverlay({
+          waterBodyId: selectedWaterBody.id,
+          fileName: file.name.slice(0, 60),
+          imageUrl: result,
+          bounds: getWaterBodyImageBounds(selectedWaterBody),
+        });
+        showToast(`Подложка «${file.name}» наложена на акваторию «${selectedWaterBody.display_label}».`);
+        resolve(null);
+      };
+      reader.onerror = () => resolve('Ошибка чтения файла изображения.');
+      reader.readAsDataURL(file);
+    });
   };
 
   const handleBuildRoute = async (simulateQuota = false) => {
@@ -1508,6 +1625,7 @@ export default function App() {
                 activeRoute={routeResult}
                 layers={layers}
                 onToggleLayers={setLayers}
+                historicOverlay={historicOverlay}
                 userOrigin={userOrigin}
                 onLocateUser={handleLocateUser}
                 pickDepthMode={pickDepthMode}
@@ -1602,6 +1720,16 @@ export default function App() {
                   reconRunning={reconRunning}
                   onRunRecon={() => void handleRunRecon()}
                   onAddDepthPoint={handleAddDepthPoint}
+                  onImportDepthPoints={handleImportDepthPoints}
+                  historicOverlay={
+                    historicOverlay ? { waterBodyId: historicOverlay.waterBodyId, fileName: historicOverlay.fileName } : null
+                  }
+                  historicOpacity={layers.historicOpacity}
+                  onChangeHistoricOpacity={(val) => setLayers((prev) => ({ ...prev, historicOpacity: val }))}
+                  onUploadHistoricMap={handleUploadHistoricMap}
+                  onClearHistoricMap={() => setHistoricOverlay(null)}
+                  openSeaMapEnabled={layers.openSeaMap}
+                  onToggleOpenSeaMap={(enabled) => setLayers((prev) => ({ ...prev, openSeaMap: enabled }))}
                   pickDepthMode={pickDepthMode}
                   onTogglePickDepthMode={() => setPickDepthMode((p) => !p)}
                   pickedCoords={pickedCoords}
@@ -1638,6 +1766,16 @@ export default function App() {
                     reconRunning={reconRunning}
                     onRunRecon={() => void handleRunRecon()}
                     onAddDepthPoint={handleAddDepthPoint}
+                    onImportDepthPoints={handleImportDepthPoints}
+                    historicOverlay={
+                      historicOverlay ? { waterBodyId: historicOverlay.waterBodyId, fileName: historicOverlay.fileName } : null
+                    }
+                    historicOpacity={layers.historicOpacity}
+                    onChangeHistoricOpacity={(val) => setLayers((prev) => ({ ...prev, historicOpacity: val }))}
+                    onUploadHistoricMap={handleUploadHistoricMap}
+                    onClearHistoricMap={() => setHistoricOverlay(null)}
+                    openSeaMapEnabled={layers.openSeaMap}
+                    onToggleOpenSeaMap={(enabled) => setLayers((prev) => ({ ...prev, openSeaMap: enabled }))}
                     pickDepthMode={pickDepthMode}
                     onTogglePickDepthMode={() => {
                       setPickDepthMode((p) => !p);
