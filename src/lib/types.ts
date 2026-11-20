@@ -155,8 +155,10 @@ export interface HourlyWeatherPoint {
   temp_c: number;
   pressure_hpa: number;
   wind_speed_ms: number;
+  wind_gusts_ms?: number;
   wind_direction_deg: number;
   cloud_cover_pct: number;
+  shortwave_radiation_wm2?: number;
   precipitation_mm: number;
 }
 
@@ -170,15 +172,21 @@ export interface WeatherSnapshot {
   pressure_delta_6h?: number; // hPa change over last 6h
   pressure_stability_48h?: number; // 0..1 (1 = rock steady over 48h)
   air_temp_c: number;
+  air_temp_delta_48h_c?: number; // °C change vs same hour 48h ago
   water_temp_c: number;
   avg_air_temp_7d_c?: number;
   avg_air_temp_14d_c?: number;
   wind_speed_ms: number;
+  wind_gusts_ms?: number;
   wind_direction_deg: number;
   wind_direction_label: string;
   cloud_cover_pct?: number; // 0..100
+  shortwave_radiation_wm2?: number; // W/m² solar irradiance
   precipitation_mm: number;
   recent_rain_72h_mm?: number; // cumulative mm over past 72h
+  river_discharge_m3s?: number; // Open-Meteo Flood API daily discharge
+  river_discharge_ratio?: number; // current / 14d baseline ratio
+  river_discharge_trend?: 'rising_fast' | 'rising' | 'steady' | 'falling';
   moon_phase: string;
   moon_illumination: number;
   hourly?: HourlyWeatherPoint[];
@@ -194,8 +202,10 @@ export interface BiteForecastSlot {
   factors: string[];
   temp_c?: number;
   wind_speed_ms?: number;
+  wind_gusts_ms?: number;
   pressure_mmhg?: number;
   cloud_cover_pct?: number;
+  radiation_wm2?: number;
 }
 
 export interface BiteForecastResponse {
@@ -217,6 +227,13 @@ export interface BiteForecastResponse {
   sunrise?: string;
   sunset?: string;
   estimated_water_temp_c?: number;
+  bio_phase_label?: string | null;
+  ice_phase?: 'first_ice' | 'midwinter' | 'last_ice' | null;
+  oxygen_risk?: 'normal' | 'moderate' | 'high';
+  oxygen_label?: string | null;
+  hydrology_label?: string | null;
+  windward_shore_hint?: string | null;
+  adaptive_factors_note?: string | null;
 }
 
 export interface GoodBiteWaterBodyItem {
@@ -270,6 +287,7 @@ export interface CatchReport {
   retrieve: string;
   weather_summary: string;
   weather_snapshot?: ReportWeatherVector;
+  predicted_f_index?: number | null;
   photo_url: string | null;
   notes: string;
   visibility: ReportVisibility;

@@ -406,13 +406,17 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                     <div className="mt-0.5 font-mono text-xs sm:text-sm font-bold text-slate-900 dark:text-white tabular-nums whitespace-nowrap">
                       {weather.wind_speed_ms} м/с
                     </div>
-                    <div className="text-[11px] text-slate-500 whitespace-nowrap">
+                    <div className="text-[11px] text-slate-500 whitespace-nowrap tabular-nums">
                       {weather.wind_direction_label}
-                      {weather.precipitation_mm > 0 ? ` · ${weather.precipitation_mm} мм` : ''}
+                      {typeof weather.wind_gusts_ms === 'number' && weather.wind_gusts_ms >= weather.wind_speed_ms + 3
+                        ? ` · пор. ${Math.round(weather.wind_gusts_ms)}`
+                        : weather.precipitation_mm > 0
+                          ? ` · ${weather.precipitation_mm} мм`
+                          : ''}
                     </div>
                   </div>
                 </div>
-                {(forecast?.sunrise || forecast?.regime) && (
+                {(forecast?.sunrise || forecast?.regime || typeof weather.air_temp_delta_48h_c === 'number') && (
                   <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600 dark:text-slate-400">
                     {forecast?.sunrise && forecast?.sunset && (
                       <span className="font-mono tabular-nums">
@@ -420,8 +424,65 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                       </span>
                     )}
                     <span className="font-semibold text-slate-700 dark:text-slate-300">
-                      {forecast?.regime === 'ice' ? 'Ледовый режим' : 'Открытая вода'}
+                      {forecast?.regime === 'ice'
+                        ? forecast.ice_phase === 'first_ice'
+                          ? 'Первый лёд'
+                          : forecast.ice_phase === 'last_ice'
+                            ? 'Последний лёд'
+                            : 'Глухозимье (лёд)'
+                        : 'Открытая вода'}
+                      {typeof weather.air_temp_delta_48h_c === 'number' && Math.abs(weather.air_temp_delta_48h_c) >= 4
+                        ? ` · ΔT48ч ${weather.air_temp_delta_48h_c > 0 ? '+' : ''}${weather.air_temp_delta_48h_c}°`
+                        : ''}
                     </span>
+                  </div>
+                )}
+
+                {/* Ecological, Hydrological & Windward Shore Insights */}
+                {(forecast?.bio_phase_label ||
+                  forecast?.hydrology_label ||
+                  forecast?.oxygen_label ||
+                  forecast?.windward_shore_hint ||
+                  forecast?.adaptive_factors_note) && (
+                  <div
+                    data-testid="forecast-eco-insights"
+                    className="mt-2.5 space-y-1 border-t border-slate-200/80 pt-2 text-[11px] leading-snug text-slate-600 dark:border-slate-700/80 dark:text-slate-300"
+                  >
+                    {forecast.bio_phase_label && (
+                      <div>
+                        <span className="font-semibold text-slate-800 dark:text-slate-100">Биофаза: </span>
+                        <span>{forecast.bio_phase_label}</span>
+                      </div>
+                    )}
+                    {forecast.hydrology_label && (
+                      <div>
+                        <span className="font-semibold text-slate-800 dark:text-slate-100">Гидрология: </span>
+                        <span>{forecast.hydrology_label}</span>
+                      </div>
+                    )}
+                    {forecast.oxygen_label && (
+                      <div
+                        className={
+                          forecast.oxygen_risk === 'high'
+                            ? 'font-medium text-amber-800 dark:text-amber-300'
+                            : undefined
+                        }
+                      >
+                        <span className="font-semibold">Кислород / сезон: </span>
+                        <span>{forecast.oxygen_label}</span>
+                      </div>
+                    )}
+                    {forecast.windward_shore_hint && (
+                      <div>
+                        <span className="font-semibold text-slate-800 dark:text-slate-100">Берег: </span>
+                        <span>{forecast.windward_shore_hint}</span>
+                      </div>
+                    )}
+                    {forecast.adaptive_factors_note && (
+                      <div className="text-sky-800 dark:text-sky-300">
+                        <span>{forecast.adaptive_factors_note}</span>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -711,7 +772,15 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                           </span>
                           {typeof activeSlot.temp_c === 'number' && (
                             <span className="font-mono text-slate-500 tabular-nums">
-                              {activeSlot.temp_c}°C · {activeSlot.wind_speed_ms} м/с · {activeSlot.pressure_mmhg} мм · об. {activeSlot.cloud_cover_pct ?? 0}%
+                              {activeSlot.temp_c}°C · {activeSlot.wind_speed_ms} м/с
+                              {typeof activeSlot.wind_gusts_ms === 'number' && activeSlot.wind_gusts_ms >= 10
+                                ? ` (пор. ${Math.round(activeSlot.wind_gusts_ms)})`
+                                : ''}
+                              {' · '}
+                              {activeSlot.pressure_mmhg} мм · об. {activeSlot.cloud_cover_pct ?? 0}%
+                              {typeof activeSlot.radiation_wm2 === 'number' && activeSlot.radiation_wm2 > 20
+                                ? ` · ${activeSlot.radiation_wm2} Вт/м²`
+                                : ''}
                             </span>
                           )}
                         </div>

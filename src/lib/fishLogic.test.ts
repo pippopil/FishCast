@@ -5,14 +5,19 @@ import {
   analyzeWaterBody,
   buildBiteForecastMetadata,
   buildSplitRouteMetrics,
+  computeBiologicalPhase,
   computeFIndexForecast,
+  computeHydrologyModifier,
+  computeOxygenAndIcePhase,
   computeReportCalibration,
   computeSunTimes,
   computeWaterBodyHabitatModifier,
+  computeWindwardShoreHint,
   decodePolyline6,
   detectProspectiveZones,
   estimateWaterTempC,
   evaluateFIndexAlerts,
+  evaluateForecastAccuracy,
   evaluateGoodBiteWaterBodies,
   getExpectedFishForWaterBody,
   pointInWaterBody,
@@ -1046,6 +1051,265 @@ test('all seed water bodies define valid inhabiting_species and getExpectedFishF
   assert.ok(fallbackFish.some((f) => f.species_id === 'karas'));
   assert.equal(fallbackFish.some((f) => f.species_id === 'sudak'), false);
 });
+
+test('computeBiologicalPhase models pre-spawn, spawning dip, post-spawn by water temp and spring shallow warming', () => {
+  const springDate = new Date('2026-04-18T10:00:00Z');
+  const warmingWeather: WeatherSnapshot = {
+    ...sampleWeather,
+    avg_air_temp_7d_c: 10.5,
+    avg_air_temp_14d_c: 7.2,
+  };
+
+  const preSpawn = computeBiologicalPhase({
+    species: sampleSpecies, // pike spawn 4.5-8.0C
+    waterTempC: 3.5,
+    weather: warmingWeather,
+    date: springDate,
+    isIceRegime: false,
+  });
+  const spawning = computeBiologicalPhase({
+    species: sampleSpecies,
+    waterTempC: 6.2,
+    weather: warmingWeather,
+    date: springDate,
+    isIceRegime: false,
+  });
+  const postSpawn = computeBiologicalPhase({
+    species: sampleSpecies,
+    waterTempC: 10.2,
+    weather: warmingWeather,
+    date: springDate,
+    isIceRegime: false,
+  });
+
+  assert.equal(preSpawn.phase, 'pre_spawn');
+  assert.ok(preSpawn.modifier > 0);
+  assert.equal(spawning.phase, 'spawning');
+  assert.ok(spawning.modifier <= -8);
+  assert.equal(postSpawn.phase, 'post_spawn');
+  assert.ok(postSpawn.modifier > 0);
+
+  const peacefulKaras: FishSpecies = {
+    ...sampleSpecies,
+    id: 'karas',
+    name: 'Карась',
+    category: 'peaceful',
+  };
+  const springKaras = computeBiologicalPhase({
+    species: peacefulKaras,
+    waterTempC: 10.5,
+    weather: warmingWeather,
+    date: new Date('2026-04-22T12:00:00Z'),
+    isIceRegime: false,
+  });
+  assert.ok(springKaras.springMiddayBoost >= 4);
+});
+
+test('computeHydrologyModifier penalizes river flood surge, rewards receding/steady flow, and ignores isolated ponds', () => {
+  const riverWb: WaterBody = { ...sampleWaterBody, type: 'river', connected_to: 'wb-main' };
+  const isolatedPond: WaterBody = { ...sampleWaterBody, type: 'pond', connected_to: null };
+
+  const floodRes = computeHydrologyModifier({
+    weather: { ...sampleWeather, river_discharge_m3s: 42.5, river_discharge_ratio: 1.9, river_discharge_trend: 'rising_fast' },
+    waterBody: riverWb,
+  });
+  const recedingRes = computeHydrologyModifier({
+    weather: { ...sampleWeather, river_discharge_m3s: 18.2, river_discharge_ratio: 1.25, river_discharge_trend: 'falling' },
+    waterBody: riverWb,
+  });
+  const isolatedRes = computeHydrologyModifier({
+    weather: { ...sampleWeather, river_discharge_m3s: 42.5, river_discharge_ratio: 1.9, river_discharge_trend: 'rising_fast' },
+    waterBody: isolatedPond,
+  });
+
+  assert.ok(floodRes.modifier <= -9);
+  assert.ok(floodRes.label?.includes('Паводок'));
+  assert.ok(recedingRes.modifier >= 3);
+  assert.equal(isolatedRes.modifier, 0);
+});
+
+test('computeOxygenAndIcePhase models summer oxygen stress and winter first_ice / midwinter / last_ice phases', () => {
+  const shallowIsolated: WaterBody = {
+    ...sampleWaterBody,
+    type: 'pond',
+    connected_to: null,
+    avg_depth_m: 1.5,
+    max_depth_m: 2.2,
+    vegetation_index: 'algal_bloom',
+  };
+
+  const summerStress = computeOxygenAndIcePhase({
+    species: sampleSpecies,
+    waterTempC: 25.5,
+    weather: { ...sampleWeather, air_temp_c: 29, wind_speed_ms: 1.4 },
+    waterBody: shallowIsolated,
+    date: new Date('2026-07-22T12:00:00Z'),
+    isIceRegime: false,
+  });
+  assert.equal(summerStress.oxygenRisk, 'high');
+  assert.ok(summerStress.middayPenalty <= -7);
+  assert.ok(summerStress.dawnBoost >= 4);
+
+  const firstIce = computeOxygenAndIcePhase({
+    species: sampleSpecies,
+    waterTempC: 1.6,
+    weather: { ...sampleWeather, air_temp_c: -4, avg_air_temp_7d_c: -3.5, avg_air_temp_14d_c: -1.5 },
+    waterBody: shallowIsolated,
+    date: new Date('2026-12-08T10:00:00Z'),
+    isIceRegime: true,
+  });
+  const midwinter = computeOxygenAndIcePhase({
+    species: sampleSpecies,
+    waterTempC: 1.4,
+    weather: { ...sampleWeather, air_temp_c: -14, avg_air_temp_7d_c: -12, avg_air_temp_14d_c: -11 },
+    waterBody: shallowIsolated,
+    date: new Date('2026-01-25T10:00:00Z'),
+    isIceRegime: true,
+  });
+  const lastIce = computeOxygenAndIcePhase({
+    species: sampleSpecies,
+    waterTempC: 1.6,
+    weather: { ...sampleWeather, air_temp_c: 1.0, avg_air_temp_7d_c: -2.0, avg_air_temp_14d_c: -5.5 },
+    waterBody: shallowIsolated,
+    date: new Date('2026-03-18T10:00:00Z'),
+    isIceRegime: true,
+  });
+
+  assert.equal(firstIce.icePhase, 'first_ice');
+  assert.ok(firstIce.modifier > 0);
+  assert.equal(midwinter.icePhase, 'midwinter');
+  assert.equal(midwinter.oxygenRisk, 'high');
+  assert.ok(midwinter.modifier <= -7);
+  assert.equal(lastIce.icePhase, 'last_ice');
+  assert.ok(lastIce.modifier > 0);
+});
+
+test('computeFIndexForecast scores solar radiation in clear water, strong wind gusts, 48h cold front, and windward shore hint', () => {
+  const sudak: FishSpecies = {
+    ...sampleSpecies,
+    id: 'sudak',
+    name: 'Судак',
+    category: 'predator',
+    optimal_water_temp_c: [12, 18],
+    season_activity: { ...sampleSpecies.season_activity, 9: 85 },
+  };
+  const clearReservoir: WaterBody = {
+    ...sampleWaterBody,
+    type: 'reservoir',
+    water_clarity: 'clear',
+    area_ha: 1500,
+    max_depth_m: 14,
+    avg_depth_m: 5.5,
+  };
+  const septDate = new Date('2026-09-12T09:00:00Z');
+
+  const calmDiffused = computeFIndexForecast({
+    species: sudak,
+    weather: {
+      ...sampleWeather,
+      air_temp_c: 15,
+      water_temp_c: 15,
+      wind_speed_ms: 4.0,
+      wind_gusts_ms: 6.0,
+      shortwave_radiation_wm2: 110,
+      air_temp_delta_48h_c: 0,
+    },
+    baseDate: septDate,
+    waterBody: clearReservoir,
+  });
+  const harshGlareGustsFront = computeFIndexForecast({
+    species: sudak,
+    weather: {
+      ...sampleWeather,
+      air_temp_c: 15,
+      water_temp_c: 15,
+      wind_speed_ms: 4.0,
+      wind_gusts_ms: 18.0,
+      shortwave_radiation_wm2: 650,
+      air_temp_delta_48h_c: -9.5,
+    },
+    baseDate: septDate,
+    waterBody: clearReservoir,
+  });
+
+  const diffusedNoon = calmDiffused.find((s) => s.day_label === 'Сегодня' && s.hour_interval === '12:00')!;
+  const harshNoon = harshGlareGustsFront.find((s) => s.day_label === 'Сегодня' && s.hour_interval === '12:00')!;
+  assert.ok(
+    diffusedNoon.f_index >= harshNoon.f_index + 16,
+    `Diffused (${diffusedNoon.f_index}) should strongly beat glare+gusts+front (${harshNoon.f_index})`
+  );
+
+  // SW wind (225 deg) blows toward NE shore (прибойный = СВ, укрытый = ЮЗ)
+  const shoreHint = computeWindwardShoreHint(225, 4.5, false);
+  assert.ok(shoreHint.includes('СВ') && shoreHint.includes('ЮЗ'));
+});
+
+test('evaluateForecastAccuracy computes hit rate, Brier score, and catch vs no_bite averages, and adaptive calibration triggers with weather snapshots', () => {
+  const baseRep: Omit<CatchReport, 'id' | 'client_event_id' | 'outcome' | 'predicted_f_index'> = {
+    user_id: 'u-1',
+    author_nickname: 'Тест',
+    author_verified: true,
+    water_body_id: sampleWaterBody.id,
+    water_body_name: sampleWaterBody.display_label,
+    lat: sampleWaterBody.center.lat,
+    lng: sampleWaterBody.center.lng,
+    created_at: '2026-11-13T07:00:00Z',
+    updated_at: '2026-11-13T07:00:00Z',
+    fish_species_id: sampleSpecies.id,
+    fish_species_name: sampleSpecies.name,
+    weight_kg: 1.5,
+    length_cm: 50,
+    bait: 'Джиг',
+    retrieve: 'Ступенька',
+    weather_summary: '',
+    photo_url: null,
+    notes: '',
+    visibility: 'public',
+    source: 'diary',
+    weather_snapshot: {
+      pressure_hpa: 1016,
+      pressure_trend: 'steady',
+      air_temp_c: 5,
+      water_temp_c: 7.5,
+      wind_speed_ms: 3.5,
+      wind_direction_label: 'ЮЗ',
+      cloud_cover_pct: 60,
+      precipitation_mm: 0,
+      hour_local: 8,
+    },
+  };
+
+  const reports: CatchReport[] = [
+    { ...baseRep, id: 'a1', client_event_id: 'a1', outcome: 'catch', predicted_f_index: 78 },
+    { ...baseRep, id: 'a2', client_event_id: 'a2', outcome: 'catch', predicted_f_index: 72 },
+    { ...baseRep, id: 'a3', client_event_id: 'a3', outcome: 'no_bite', weight_kg: null, length_cm: null, predicted_f_index: 34 },
+    { ...baseRep, id: 'a4', client_event_id: 'a4', outcome: 'no_bite', weight_kg: null, length_cm: null, predicted_f_index: 64 },
+  ];
+
+  const acc = evaluateForecastAccuracy(reports);
+  assert.equal(acc.evaluatedCount, 4);
+  assert.equal(acc.hitRatePct, 75);
+  assert.ok(acc.brierScore !== null && acc.brierScore < 0.2);
+  assert.equal(acc.avgCatchF, 75);
+  assert.equal(acc.avgNoBiteF, 49);
+
+  // Adaptive calibration with consistent catch cluster matching current steady pressure + moderate wind
+  const adaptiveCal = computeReportCalibration({
+    waterBody: sampleWaterBody,
+    species: sampleSpecies,
+    weather: sampleWeather,
+    reports: [
+      { ...baseRep, id: 'c1', client_event_id: 'c1', outcome: 'catch' },
+      { ...baseRep, id: 'c2', client_event_id: 'c2', outcome: 'catch' },
+      { ...baseRep, id: 'c3', client_event_id: 'c3', outcome: 'catch' },
+    ],
+    baseDate: new Date('2026-11-13T09:00:00Z'),
+    slotHour: 8,
+  });
+  assert.ok(adaptiveCal.adaptiveDelta >= 2, `Expected positive adaptiveDelta, got ${adaptiveCal.adaptiveDelta}`);
+  assert.ok(adaptiveCal.adaptiveNote?.includes('Адаптация по водоёму'));
+});
+
 
 
 

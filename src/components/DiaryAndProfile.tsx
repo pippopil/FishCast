@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Camera, Download, LogOut, NotebookPen, RefreshCw, Trash2, UserCheck, WifiOff } from 'lucide-react';
+import { evaluateForecastAccuracy } from '../lib/fishLogic';
 import { resolveReportPhotoUrl } from '../utils/samplePhotos';
 import type {
   CatchReport,
@@ -97,6 +98,7 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
     if (r.bait && r.outcome !== 'no_bite') baitCounts.set(r.bait, (baitCounts.get(r.bait) ?? 0) + 1);
   }
   const topBait = [...baitCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'Виброхвост 12 см';
+  const forecastAccuracy = useMemo(() => evaluateForecastAccuracy(diaryReports), [diaryReports]);
 
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -270,7 +272,7 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
       </div>
 
       {/* Stats Strip */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
           <div className="text-xs text-slate-500">Записей и отметок</div>
           <div className="mt-1 font-mono text-2xl font-bold text-slate-900 dark:text-white tabular-nums">
@@ -287,7 +289,21 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
           <div className="text-xs text-slate-500">Лучшая приманка</div>
           <div className="mt-1 truncate text-sm font-bold text-slate-900 dark:text-white">{topBait}</div>
         </div>
-        <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <div
+          data-testid="forecast-accuracy-card"
+          className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900"
+        >
+          <div className="text-xs text-slate-500">Точность прогноза F</div>
+          <div className="mt-1 font-mono text-2xl font-bold text-teal-700 dark:text-teal-400 tabular-nums">
+            {forecastAccuracy.hitRatePct !== null ? `${forecastAccuracy.hitRatePct}%` : '—'}
+          </div>
+          <div className="mt-0.5 truncate text-[11px] text-slate-500 tabular-nums">
+            {forecastAccuracy.evaluatedCount > 0
+              ? `Brier ${forecastAccuracy.brierScore?.toFixed(2)} · ${forecastAccuracy.evaluatedCount} отч.`
+              : 'сверяется по новым отчётам'}
+          </div>
+        </div>
+        <div className="col-span-2 rounded-2xl border border-slate-200 bg-white p-4 md:col-span-1 dark:border-slate-800 dark:bg-slate-900">
           <div className="text-xs text-slate-500">Очередь синхронизации</div>
           <div className="mt-1 flex items-center justify-between">
             <span className="font-mono text-2xl font-bold text-slate-900 dark:text-white tabular-nums">
@@ -553,6 +569,11 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
                           {rep.outcome === 'no_bite' && (
                             <span className="rounded-md bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
                               Без поклёвок (калибровка)
+                            </span>
+                          )}
+                          {typeof rep.predicted_f_index === 'number' && (
+                            <span className="rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-600 tabular-nums dark:bg-slate-800 dark:text-slate-300">
+                              Прогноз F-{rep.predicted_f_index}
                             </span>
                           )}
                         </div>

@@ -733,6 +733,11 @@ async function startServer() {
           }
         : undefined;
 
+    const predictedFIndex =
+      typeof req.body.predicted_f_index === 'number' && Number.isFinite(req.body.predicted_f_index)
+        ? Math.max(0, Math.min(100, Math.round(req.body.predicted_f_index)))
+        : null;
+
     const report: CatchReport = {
       id: `rep-${crypto.randomUUID().slice(0, 8)}`,
       client_event_id: clientEventId,
@@ -754,6 +759,7 @@ async function startServer() {
       retrieve: typeof req.body.retrieve === 'string' ? req.body.retrieve.trim() : '',
       weather_summary: typeof req.body.weather_summary === 'string' ? req.body.weather_summary : '',
       weather_snapshot: weatherSnapshot,
+      predicted_f_index: predictedFIndex,
       photo_url: safePhotoUrl,
       notes: typeof req.body.notes === 'string' ? req.body.notes.trim() : '',
       visibility: req.body.visibility ?? user?.privacy_default ?? 'public',

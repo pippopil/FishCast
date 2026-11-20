@@ -81,19 +81,80 @@ export function buildFallbackWeather(lat = 55.975, lng = 36.825): WeatherSnapsho
     pressure_delta_6h: 0,
     pressure_stability_48h: 0.8,
     air_temp_c: air,
+    air_temp_delta_48h_c: 0,
     water_temp_c: water,
     avg_air_temp_7d_c: air,
     avg_air_temp_14d_c: air,
     wind_speed_ms: 2.8,
+    wind_gusts_ms: 5.0,
     wind_direction_deg: 225,
     wind_direction_label: 'ЮЗ',
     cloud_cover_pct: 55,
+    shortwave_radiation_wm2: 180,
     precipitation_mm: 0,
     recent_rain_72h_mm: 0,
     moon_phase: moon.phase,
     moon_illumination: moon.illum,
     source: 'offline-fallback',
   };
+}
+
+async function fetchRiverDischargeDirect(
+  lat: number,
+  lng: number
+): Promise<{
+  river_discharge_m3s?: number;
+  river_discharge_ratio?: number;
+  river_discharge_trend?: WeatherSnapshot['river_discharge_trend'];
+}> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2500);
+  try {
+    const url =
+      `https://flood-api.open-meteo.com/v1/flood?latitude=${lat.toFixed(4)}&longitude=${lng.toFixed(4)}` +
+      `&daily=river_discharge&past_days=14&forecast_days=3`;
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return {};
+    const json = (await res.json()) as {
+      daily?: { time?: string[]; river_discharge?: Array<number | null> };
+    };
+    const times = json.daily?.time ?? [];
+    const values = json.daily?.river_discharge ?? [];
+    if (values.length < 3) return {};
+    const todayIso = new Date().toISOString().slice(0, 10);
+    let todayIdx = times.indexOf(todayIso);
+    if (todayIdx < 0) todayIdx = Math.min(values.length - 1, Math.max(0, values.length - 3));
+    const currentQ = values[todayIdx];
+    if (typeof currentQ !== 'number' || !Number.isFinite(currentQ) || currentQ < 0) return {};
+
+    const pastVals: number[] = [];
+    for (let i = Math.max(0, todayIdx - 14); i < todayIdx; i++) {
+      const v = values[i];
+      if (typeof v === 'number' && Number.isFinite(v) && v >= 0) pastVals.push(v);
+    }
+    if (pastVals.length === 0) return { river_discharge_m3s: Number(currentQ.toFixed(1)) };
+    const sorted = [...pastVals].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    const ratio = median > 0.05 ? Number((currentQ / median).toFixed(2)) : 1.0;
+
+    const prevQ = values[Math.max(0, todayIdx - 2)];
+    let trend: WeatherSnapshot['river_discharge_trend'] = 'steady';
+    if (typeof prevQ === 'number' && Number.isFinite(prevQ)) {
+      const pct = (currentQ - prevQ) / Math.max(0.1, prevQ);
+      if (pct >= 0.25) trend = 'rising_fast';
+      else if (pct >= 0.08) trend = 'rising';
+      else if (pct <= -0.08) trend = 'falling';
+    }
+    return {
+      river_discharge_m3s: Number(currentQ.toFixed(1)),
+      river_discharge_ratio: ratio,
+      river_discharge_trend: trend,
+    };
+  } catch {
+    return {};
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function fetchOpenMeteoWeatherDirect(lat: number, lng: number): Promise<WeatherSnapshot> {
@@ -103,11 +164,13 @@ export async function fetchOpenMeteoWeatherDirect(lat: number, lng: number): Pro
     const timer = setTimeout(() => controller.abort(), 4500);
     const url =
       `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(4)}&longitude=${lng.toFixed(4)}` +
-      `&current=temperature_2m,precipitation,pressure_msl,surface_pressure,cloud_cover,wind_speed_10m,wind_direction_10m` +
-      `&hourly=temperature_2m,pressure_msl,wind_speed_10m,wind_direction_10m,cloud_cover,precipitation` +
+      `&current=temperature_2m,precipitation,pressure_msl,surface_pressure,cloud_cover,wind_speed_10m,wind_gusts_10m,wind_direction_10m,shortwave_radiation` +
+      `&hourly=temperature_2m,pressure_msl,wind_speed_10m,wind_gusts_10m,wind_direction_10m,cloud_cover,shortwave_radiation,precipitation` +
       `&past_days=14&forecast_days=3&wind_speed_unit=ms&timezone=auto`;
-    const res = await fetch(url, { signal: controller.signal });
-    clearTimeout(timer);
+    const [res, floodMetrics] = await Promise.all([
+      fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer)),
+      fetchRiverDischargeDirect(lat, lng),
+    ]);
     if (!res.ok) return buildFallbackWeather(lat, lng);
     const data = (await res.json()) as {
       current?: {
@@ -118,15 +181,19 @@ export async function fetchOpenMeteoWeatherDirect(lat: number, lng: number): Pro
         surface_pressure?: number;
         cloud_cover?: number;
         wind_speed_10m?: number;
+        wind_gusts_10m?: number;
         wind_direction_10m?: number;
+        shortwave_radiation?: number;
       };
       hourly?: {
         time?: string[];
         temperature_2m?: number[];
         pressure_msl?: number[];
         wind_speed_10m?: number[];
+        wind_gusts_10m?: number[];
         wind_direction_10m?: number[];
         cloud_cover?: number[];
+        shortwave_radiation?: number[];
         precipitation?: number[];
       };
     };
@@ -137,8 +204,10 @@ export async function fetchOpenMeteoWeatherDirect(lat: number, lng: number): Pro
     const hTemp = data.hourly?.temperature_2m ?? [];
     const hPres = data.hourly?.pressure_msl ?? [];
     const hWind = data.hourly?.wind_speed_10m ?? [];
+    const hGust = data.hourly?.wind_gusts_10m ?? [];
     const hWDir = data.hourly?.wind_direction_10m ?? [];
     const hCloud = data.hourly?.cloud_cover ?? [];
+    const hRad = data.hourly?.shortwave_radiation ?? [];
     const hPrecip = data.hourly?.precipitation ?? [];
 
     const curPrefix = (cur.time ?? new Date().toISOString()).slice(0, 13);
@@ -162,6 +231,14 @@ export async function fetchOpenMeteoWeatherDirect(lat: number, lng: number): Pro
 
     const avg7d = meanRange(hTemp, curIdx - 7 * 24, curIdx + 1);
     const avg14d = meanRange(hTemp, curIdx - 14 * 24, curIdx + 1);
+
+    let airTempDelta48h: number | undefined;
+    if (curIdx >= 48 && typeof hTemp[curIdx - 48] === 'number') {
+      airTempDelta48h = Number((cur.temperature_2m - hTemp[curIdx - 48]).toFixed(1));
+    } else if (curIdx >= 24 && typeof hTemp[curIdx - 24] === 'number') {
+      airTempDelta48h = Number((cur.temperature_2m - hTemp[curIdx - 24]).toFixed(1));
+    }
+
     let rain72h = 0;
     for (let i = Math.max(0, curIdx - 72); i <= Math.min(hPrecip.length - 1, curIdx); i++) {
       rain72h += Number(hPrecip[i] ?? 0);
@@ -195,19 +272,36 @@ export async function fetchOpenMeteoWeatherDirect(lat: number, lng: number): Pro
     const winStart = Math.max(0, curIdx - 48);
     const winEnd = Math.min(hTime.length, curIdx + 76);
     for (let i = winStart; i < winEnd; i++) {
+      const gustVal = hGust[i];
+      const radVal = hRad[i];
       hourlyCompact.push({
         time: hTime[i],
         temp_c: Number((hTemp[i] ?? cur.temperature_2m).toFixed(1)),
         pressure_hpa: Number((hPres[i] ?? pressureHpa).toFixed(1)),
         wind_speed_ms: Number((hWind[i] ?? cur.wind_speed_10m ?? 3.0).toFixed(1)),
+        wind_gusts_ms: typeof gustVal === 'number' ? Number(gustVal.toFixed(1)) : undefined,
         wind_direction_deg: Math.round(hWDir[i] ?? cur.wind_direction_10m ?? 210),
         cloud_cover_pct: Math.round(hCloud[i] ?? cur.cloud_cover ?? 55),
+        shortwave_radiation_wm2: typeof radVal === 'number' ? Math.round(radVal) : undefined,
         precipitation_mm: Number((hPrecip[i] ?? 0).toFixed(1)),
       });
     }
 
     const air = Number(cur.temperature_2m.toFixed(1));
     const windDeg = Math.round(cur.wind_direction_10m ?? 210);
+    const curGusts =
+      typeof cur.wind_gusts_10m === 'number'
+        ? Number(cur.wind_gusts_10m.toFixed(1))
+        : typeof hGust[curIdx] === 'number'
+          ? Number(hGust[curIdx].toFixed(1))
+          : undefined;
+    const curRad =
+      typeof cur.shortwave_radiation === 'number'
+        ? Math.round(cur.shortwave_radiation)
+        : typeof hRad[curIdx] === 'number'
+          ? Math.round(hRad[curIdx])
+          : undefined;
+
     return {
       lat,
       lng,
@@ -218,15 +312,19 @@ export async function fetchOpenMeteoWeatherDirect(lat: number, lng: number): Pro
       pressure_delta_6h: delta6h,
       pressure_stability_48h: stability48h,
       air_temp_c: air,
+      air_temp_delta_48h_c: airTempDelta48h,
       water_temp_c: Number(Math.max(1.0, (avg14d ?? air) * 0.78 + 1.4).toFixed(1)),
       avg_air_temp_7d_c: avg7d,
       avg_air_temp_14d_c: avg14d,
       wind_speed_ms: Number((cur.wind_speed_10m ?? 3.0).toFixed(1)),
+      wind_gusts_ms: curGusts,
       wind_direction_deg: windDeg,
       wind_direction_label: compassDirection(windDeg),
       cloud_cover_pct: Math.round(cur.cloud_cover ?? hCloud[curIdx] ?? 55),
+      shortwave_radiation_wm2: curRad,
       precipitation_mm: Number((cur.precipitation ?? 0).toFixed(1)),
       recent_rain_72h_mm: Number(rain72h.toFixed(1)),
+      ...floodMetrics,
       moon_phase: moon.phase,
       moon_illumination: moon.illum,
       hourly: hourlyCompact,

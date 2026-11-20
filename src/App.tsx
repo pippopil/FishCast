@@ -1089,6 +1089,33 @@ export default function App() {
         }
       : undefined;
 
+    const nowDate = new Date();
+    const currentBlockHour = Math.floor(nowDate.getHours() / 3) * 3;
+    const currentHourLabel = `${currentBlockHour.toString().padStart(2, '0')}:00`;
+    let predictedFIndex: number | null = null;
+    if (
+      forecast &&
+      forecast.fish_id === (species?.id ?? payload.fish_species_id) &&
+      (forecast.water_body_id ?? null) === (wb?.id ?? null)
+    ) {
+      const slot =
+        forecast.slots.find((s) => s.day_label === 'Сегодня' && s.hour_interval === currentHourLabel) ??
+        forecast.slots[0];
+      predictedFIndex = slot ? slot.f_index : null;
+    } else if (species) {
+      const computedSlots = computeFIndexForecast({
+        species,
+        weather: effectiveWeather,
+        baseDate: nowDate,
+        waterBody: wb,
+        reports,
+      });
+      const slot =
+        computedSlots.find((s) => s.day_label === 'Сегодня' && s.hour_interval === currentHourLabel) ??
+        computedSlots[0];
+      predictedFIndex = slot ? slot.f_index : null;
+    }
+
     const fullPayload = {
       ...payload,
       outcome,
@@ -1099,7 +1126,8 @@ export default function App() {
         ? `${weather.pressure_mmhg} мм рт. ст. · ${weather.air_temp_c}°C · ${weather.wind_direction_label} ${weather.wind_speed_ms} м/с`
         : '',
       weather_snapshot: weatherVector,
-      created_at: new Date().toISOString(),
+      predicted_f_index: predictedFIndex,
+      created_at: nowDate.toISOString(),
     };
 
     if (!isOnline) {
@@ -1124,6 +1152,7 @@ export default function App() {
         retrieve: payload.retrieve ?? '',
         weather_summary: fullPayload.weather_summary,
         weather_snapshot: weatherVector,
+        predicted_f_index: predictedFIndex,
         photo_url: payload.photo_url,
         notes: payload.notes,
         visibility: payload.visibility,
