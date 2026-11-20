@@ -38,6 +38,7 @@ import {
 import {
   SEED_ACCESS_POINTS,
   SEED_BATHYMETRY_POINTS,
+  SEED_DATA_VERSION,
   SEED_KNOTS,
   SEED_REPORTS,
   SEED_SPECIES,
@@ -238,6 +239,12 @@ export default function App() {
   useEffect(() => {
     let active = true;
     async function bootstrap() {
+      const storedSeedVersion = await offlineDb.getSeedVersion();
+      if (storedSeedVersion !== SEED_DATA_VERSION) {
+        await offlineDb.clearStaleSeedCaches();
+        await offlineDb.setSeedVersion(SEED_DATA_VERSION);
+      }
+
       const existingQueue = await offlineDb.getQueue();
       if (active) setSyncQueue(existingQueue);
 
@@ -301,7 +308,9 @@ export default function App() {
         setUser(meJson.user ?? null);
 
         if (wbs.length > 0) {
-          setSelectedWaterBody((prev) => prev ?? wbs[0]);
+          setSelectedWaterBody((prev) =>
+            prev ? wbs.find((w) => w.id === prev.id) ?? wbs[0] : wbs[0]
+          );
         }
 
         await Promise.all([

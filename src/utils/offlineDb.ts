@@ -280,4 +280,43 @@ export const offlineDb = {
       return { count: 0, totalBytes: 0 };
     }
   },
+
+  async getSeedVersion(): Promise<number | null> {
+    return kvGet<number>('seed_data_version');
+  },
+
+  async setSeedVersion(version: number): Promise<void> {
+    await kvSet('seed_data_version', version);
+  },
+
+  async clearStaleSeedCaches(): Promise<void> {
+    try {
+      const db = await openDb();
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction('kv', 'readwrite');
+        const store = tx.objectStore('kv');
+        const req = store.openCursor();
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (cursor) {
+            const key = String(cursor.key);
+            if (
+              key === 'water_bodies' ||
+              key === 'reports_cache' ||
+              key === 'last_water_body' ||
+              key.startsWith('wb_bundle_')
+            ) {
+              cursor.delete();
+            }
+            cursor.continue();
+          } else {
+            resolve();
+          }
+        };
+        req.onerror = () => reject(req.error);
+      });
+    } catch {
+      // Graceful no-op if IndexedDB unavailable
+    }
+  },
 };

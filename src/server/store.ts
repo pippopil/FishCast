@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs';
 import {
   SEED_ACCESS_POINTS,
   SEED_BATHYMETRY_POINTS,
+  SEED_DATA_VERSION,
   SEED_KNOTS,
   SEED_REPORTS,
   SEED_SPECIES,
@@ -28,6 +29,7 @@ export interface StoredUser extends UserProfile {
 }
 
 export interface PersistedDatabase {
+  seedVersion?: number;
   users: StoredUser[];
   waterBodies: WaterBody[];
   bathymetryPoints: BathymetryPoint[];
@@ -40,9 +42,17 @@ export interface PersistedDatabase {
 const DATA_DIR = path.resolve(process.cwd(), '.data');
 const DB_FILE = path.join(DATA_DIR, 'fishcast-db.json');
 
+const RETIRED_SEED_IDS = new Set([
+  'wb-unnamed-pesochnaya',
+  'wb-unnamed-rodnik',
+  'wb-buzharovo-pond',
+  'wb-crowd-unverified',
+]);
+
 function createInitialDb(): PersistedDatabase {
   const demoHash = bcrypt.hashSync('fishcast2026', 8);
   return {
+    seedVersion: SEED_DATA_VERSION,
     users: [
       {
         id: 'user-demo-1',
@@ -102,20 +112,68 @@ class FishCastStore {
         const parsed = JSON.parse(raw) as PersistedDatabase;
         if (parsed && Array.isArray(parsed.waterBodies) && Array.isArray(parsed.catchReports)) {
           let changed = false;
-          const existingWbIds = new Set(parsed.waterBodies.map((w) => w.id));
-          for (const seedWb of SEED_WATER_BODIES) {
-            if (!existingWbIds.has(seedWb.id)) {
-              parsed.waterBodies.push(seedWb);
-              changed = true;
+          const seedWbById = new Map(SEED_WATER_BODIES.map((w) => [w.id, w]));
+          const seedApById = new Map(SEED_ACCESS_POINTS.map((a) => [a.id, a]));
+          const seedBpById = new Map(SEED_BATHYMETRY_POINTS.map((b) => [b.id, b]));
+          const seedRepById = new Map(SEED_REPORTS.map((r) => [r.id, r]));
+
+          if ((parsed.seedVersion ?? 1) < SEED_DATA_VERSION) {
+            const customWbs = parsed.waterBodies.filter(
+              (w) => !RETIRED_SEED_IDS.has(w.id) && !seedWbById.has(w.id)
+            );
+            parsed.waterBodies = [...SEED_WATER_BODIES, ...customWbs];
+
+            const customAps = (parsed.accessPoints ?? []).filter(
+              (ap) =>
+                !RETIRED_SEED_IDS.has(ap.water_body_id) &&
+                !seedApById.has(ap.id) &&
+                !ap.id.startsWith('ap-')
+            );
+            parsed.accessPoints = [...SEED_ACCESS_POINTS, ...customAps];
+
+            const customBps = (parsed.bathymetryPoints ?? []).filter(
+              (bp) => !RETIRED_SEED_IDS.has(bp.water_body_id) && !seedBpById.has(bp.id)
+            );
+            parsed.bathymetryPoints = [...SEED_BATHYMETRY_POINTS, ...customBps];
+
+            const customReports = parsed.catchReports.filter(
+              (rep) =>
+                (!rep.water_body_id || !RETIRED_SEED_IDS.has(rep.water_body_id)) &&
+                !seedRepById.has(rep.id)
+            );
+            parsed.catchReports = [...SEED_REPORTS, ...customReports];
+
+            const cleanedAnalyses: Record<string, WaterBodyAnalysis> = {};
+            for (const [wbId, val] of Object.entries(parsed.analyses ?? {})) {
+              if (!RETIRED_SEED_IDS.has(wbId) && !seedWbById.has(wbId)) {
+                cleanedAnalyses[wbId] = val;
+              }
+            }
+            parsed.analyses = cleanedAnalyses;
+
+            const seenSet = new Set(parsed.seenClientEventIds ?? []);
+            for (const r of SEED_REPORTS) seenSet.add(r.client_event_id);
+            parsed.seenClientEventIds = Array.from(seenSet);
+
+            parsed.seedVersion = SEED_DATA_VERSION;
+            changed = true;
+          } else {
+            const existingWbIds = new Set(parsed.waterBodies.map((w) => w.id));
+            for (const seedWb of SEED_WATER_BODIES) {
+              if (!existingWbIds.has(seedWb.id)) {
+                parsed.waterBodies.push(seedWb);
+                changed = true;
+              }
+            }
+            const existingApIds = new Set((parsed.accessPoints ?? []).map((a) => a.id));
+            for (const seedAp of SEED_ACCESS_POINTS) {
+              if (!existingApIds.has(seedAp.id)) {
+                parsed.accessPoints.push(seedAp);
+                changed = true;
+              }
             }
           }
-          const existingApIds = new Set((parsed.accessPoints ?? []).map((a) => a.id));
-          for (const seedAp of SEED_ACCESS_POINTS) {
-            if (!existingApIds.has(seedAp.id)) {
-              parsed.accessPoints.push(seedAp);
-              changed = true;
-            }
-          }
+
           if (changed) this.persist(parsed);
           return parsed;
         }

@@ -8,6 +8,7 @@ import {
   detectProspectiveZones,
   evaluateFIndexAlerts,
   evaluateGoodBiteWaterBodies,
+  pointInWaterBody,
   recommendLures,
   selectBestAccessPoint,
   validateCatchReportInput,
@@ -487,5 +488,137 @@ test('buildBathymetryProfile orders points along chosen transect line and comput
   assert.equal(southNorth[0].id, 'p-west');
   assert.equal(southNorth[2].id, 'p-east');
   assert.deepEqual(buildBathymetryProfile([], 'transect'), []);
+});
+
+test('pointInWaterBody excludes interior island holes from open water', () => {
+  const wbWithIsland: Pick<WaterBody, 'polygon' | 'polygon_rings'> = {
+    polygon: [
+      [36.0, 56.0],
+      [36.2, 56.0],
+      [36.2, 56.2],
+      [36.0, 56.2],
+      [36.0, 56.0],
+    ],
+    polygon_rings: [
+      [
+        [36.0, 56.0],
+        [36.2, 56.0],
+        [36.2, 56.2],
+        [36.0, 56.2],
+        [36.0, 56.0],
+      ],
+      [
+        [36.06, 56.06],
+        [36.14, 56.06],
+        [36.14, 56.14],
+        [36.06, 56.14],
+        [36.06, 56.06],
+      ],
+    ],
+  };
+
+  assert.equal(pointInWaterBody({ lat: 56.02, lng: 36.02 }, wbWithIsland), true);
+  assert.equal(pointInWaterBody({ lat: 56.1, lng: 36.1 }, wbWithIsland), false);
+  assert.equal(pointInWaterBody({ lat: 56.5, lng: 36.5 }, wbWithIsland), false);
+});
+
+test('all seed water bodies, contours, bathymetry points, reports, and access points obey real water/shore invariants', async () => {
+  const {
+    SEED_ACCESS_POINTS,
+    SEED_BATHYMETRY_POINTS,
+    SEED_DATA_VERSION,
+    SEED_REPORTS,
+    SEED_WATER_BODIES,
+  } = await import('../data/seedData');
+
+  assert.ok(SEED_DATA_VERSION >= 2);
+
+  const retiredIds = [
+    'wb-unnamed-pesochnaya',
+    'wb-unnamed-rodnik',
+    'wb-buzharovo-pond',
+    'wb-crowd-unverified',
+  ];
+  for (const id of retiredIds) {
+    assert.equal(SEED_WATER_BODIES.some((w) => w.id === id), false, `Retired ${id} must not exist`);
+    assert.equal(
+      SEED_ACCESS_POINTS.some((ap) => ap.water_body_id === id),
+      false,
+      `Access point for retired ${id} must not exist`
+    );
+    assert.equal(
+      SEED_BATHYMETRY_POINTS.some((bp) => bp.water_body_id === id),
+      false,
+      `Bathymetry for retired ${id} must not exist`
+    );
+    assert.equal(
+      SEED_REPORTS.some((r) => r.water_body_id === id),
+      false,
+      `Report for retired ${id} must not exist`
+    );
+  }
+
+  const wbMap = new Map(SEED_WATER_BODIES.map((w) => [w.id, w]));
+
+  for (const wb of SEED_WATER_BODIES) {
+    assert.ok(wb.polygon.length >= 4, `${wb.id} must have closed polygon`);
+    const first = wb.polygon[0];
+    const last = wb.polygon[wb.polygon.length - 1];
+    assert.equal(first[0], last[0], `${wb.id} polygon lng must be closed`);
+    assert.equal(first[1], last[1], `${wb.id} polygon lat must be closed`);
+
+    assert.equal(pointInWaterBody(wb.center, wb), true, `${wb.id} center must be inside water`);
+    if (wb.target_zone) {
+      assert.equal(
+        pointInWaterBody(wb.target_zone, wb),
+        true,
+        `${wb.id} target_zone must be inside water`
+      );
+    }
+
+    if (wb.contours) {
+      for (const c of wb.contours) {
+        assert.ok(c.coordinates.length >= 4, `${wb.id} contour ${c.depth_m}m must be closed`);
+        for (const [lng, lat] of c.coordinates) {
+          assert.equal(
+            pointInWaterBody({ lat, lng }, wb),
+            true,
+            `${wb.id} contour ${c.depth_m}m vertex must be inside water`
+          );
+        }
+      }
+    }
+  }
+
+  for (const bp of SEED_BATHYMETRY_POINTS) {
+    const wb = wbMap.get(bp.water_body_id);
+    assert.ok(wb, `Bathymetry ${bp.id} missing water body ${bp.water_body_id}`);
+    assert.equal(
+      pointInWaterBody({ lat: bp.lat, lng: bp.lng }, wb),
+      true,
+      `Bathymetry ${bp.id} must be inside water of ${wb.id}`
+    );
+  }
+
+  for (const rep of SEED_REPORTS) {
+    assert.ok(rep.water_body_id, `Report ${rep.id} must reference a water body`);
+    const wb = wbMap.get(rep.water_body_id);
+    assert.ok(wb, `Report ${rep.id} missing water body ${rep.water_body_id}`);
+    assert.equal(
+      pointInWaterBody({ lat: rep.lat, lng: rep.lng }, wb),
+      true,
+      `Report ${rep.id} must be inside water of ${wb.id}`
+    );
+  }
+
+  for (const ap of SEED_ACCESS_POINTS) {
+    const wb = wbMap.get(ap.water_body_id);
+    assert.ok(wb, `Access point ${ap.id} missing water body ${ap.water_body_id}`);
+    assert.equal(
+      pointInWaterBody({ lat: ap.lat, lng: ap.lng }, wb),
+      false,
+      `Shore access point ${ap.id} should stay on shore outside water of ${wb.id}`
+    );
+  }
 });
 

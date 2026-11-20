@@ -67,6 +67,7 @@ export interface WaterBody {
   type: WaterBodyType;
   center: LatLng;
   polygon: [number, number][]; // [lng, lat][] closed ring
+  polygon_rings?: [number, number][][]; // Optional [outer, ...holes] closed rings for reservoirs with islands
   area_ha: number;
   source: DataSourceType;
   confidence: number; // 0..1

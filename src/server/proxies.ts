@@ -3,6 +3,7 @@ import {
   buildSplitRouteMetrics,
   computeFIndexForecast,
   decodePolyline6,
+  findInteriorWaterPoint,
   haversineMeters,
   windDegreesToLabel,
 } from '../lib/fishLogic.ts';
@@ -654,41 +655,72 @@ function defaultDepthForType(type: WaterBodyType): { max: number; avg: number; a
   }
 }
 
-function buildPolygonFromLineNodes(nodes: Array<{ lat: number; lon: number }>): [number, number][] {
-  const sampled: Array<{ lat: number; lon: number }> = [];
-  const step = Math.max(1, Math.floor(nodes.length / 12));
-  for (let i = 0; i < nodes.length; i += step) {
-    sampled.push(nodes[i]);
+function buildPolygonFromLineNodes(
+  nodes: Array<{ lat: number; lon: number }>,
+  halfWidthM = 28
+): { polygon: [number, number][]; center: LatLng } {
+  const deduped: Array<{ lat: number; lon: number }> = [];
+  for (const n of nodes) {
+    const prev = deduped[deduped.length - 1];
+    if (!prev || haversineMeters({ lat: prev.lat, lng: prev.lon }, { lat: n.lat, lng: n.lon }) >= 35) {
+      deduped.push(n);
+    }
   }
-  if (nodes.length > 0 && sampled[sampled.length - 1] !== nodes[nodes.length - 1]) {
-    sampled.push(nodes[nodes.length - 1]);
+  const step = Math.max(1, Math.floor(deduped.length / 55));
+  const sampled: Array<{ lat: number; lon: number }> = [];
+  for (let i = 0; i < deduped.length; i += step) {
+    sampled.push(deduped[i]);
+  }
+  if (deduped.length > 0 && sampled[sampled.length - 1] !== deduped[deduped.length - 1]) {
+    sampled.push(deduped[deduped.length - 1]);
   }
   if (sampled.length < 2) {
     const pt = nodes[0] ?? { lat: 55.975, lon: 36.825 };
-    return [
-      [pt.lon - 0.002, pt.lat - 0.0012],
-      [pt.lon + 0.002, pt.lat - 0.0012],
-      [pt.lon + 0.002, pt.lat + 0.0012],
-      [pt.lon - 0.002, pt.lat + 0.0012],
-      [pt.lon - 0.002, pt.lat - 0.0012],
-    ];
+    const r = 0.0008;
+    return {
+      center: { lat: Number(pt.lat.toFixed(5)), lng: Number(pt.lon.toFixed(5)) },
+      polygon: [
+        [Number((pt.lon - r).toFixed(6)), Number(pt.lat.toFixed(6))],
+        [Number(pt.lon.toFixed(6)), Number((pt.lat - r * 0.7).toFixed(6))],
+        [Number((pt.lon + r).toFixed(6)), Number(pt.lat.toFixed(6))],
+        [Number(pt.lon.toFixed(6)), Number((pt.lat + r * 0.7).toFixed(6))],
+        [Number((pt.lon - r).toFixed(6)), Number(pt.lat.toFixed(6))],
+      ],
+    };
   }
+
+  const refLat = sampled.reduce((s, p) => s + p.lat, 0) / sampled.length;
+  const kx = 111320 * (Math.cos((refLat * Math.PI) / 180) || 1);
+  const ky = 110540;
   const left: [number, number][] = [];
   const right: [number, number][] = [];
-  for (const pt of sampled) {
-    left.push([Number((pt.lon - 0.0014).toFixed(6)), Number((pt.lat + 0.0009).toFixed(6))]);
-    right.unshift([Number((pt.lon + 0.0014).toFixed(6)), Number((pt.lat - 0.0009).toFixed(6))]);
+
+  for (let i = 0; i < sampled.length; i++) {
+    const pPrev = sampled[Math.max(0, i - 1)];
+    const pNext = sampled[Math.min(sampled.length - 1, i + 1)];
+    const dx = (pNext.lon - pPrev.lon) * kx;
+    const dy = (pNext.lat - pPrev.lat) * ky;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len;
+    const ny = dx / len;
+    const dLon = (nx * halfWidthM) / kx;
+    const dLat = (ny * halfWidthM) / ky;
+    left.push([Number((sampled[i].lon + dLon).toFixed(5)), Number((sampled[i].lat + dLat).toFixed(5))]);
+    right.unshift([Number((sampled[i].lon - dLon).toFixed(5)), Number((sampled[i].lat - dLat).toFixed(5))]);
   }
-  const ring = [...left, ...right];
-  ring.push(ring[0]);
-  return ring;
+  const ring = [...left, ...right, left[0]];
+  const mid = sampled[Math.floor(sampled.length / 2)];
+  return {
+    polygon: ring,
+    center: { lat: Number(mid.lat.toFixed(5)), lng: Number(mid.lon.toFixed(5)) },
+  };
 }
 
 function buildClosedPolygonFromNodes(nodes: Array<{ lat: number; lon: number }>): [number, number][] {
-  const step = Math.max(1, Math.floor(nodes.length / 22));
+  const step = Math.max(1, Math.floor(nodes.length / 40));
   const ring: [number, number][] = [];
   for (let i = 0; i < nodes.length; i += step) {
-    ring.push([Number(nodes[i].lon.toFixed(6)), Number(nodes[i].lat.toFixed(6))]);
+    ring.push([Number(nodes[i].lon.toFixed(5)), Number(nodes[i].lat.toFixed(5))]);
   }
   if (ring.length >= 3) {
     const first = ring[0];
@@ -698,7 +730,7 @@ function buildClosedPolygonFromNodes(nodes: Array<{ lat: number; lon: number }>)
     }
     return ring;
   }
-  return buildPolygonFromLineNodes(nodes);
+  return buildPolygonFromLineNodes(nodes).polygon;
 }
 
 export function buildWaterBodyFromGeocodeFeature(params: {
@@ -710,22 +742,18 @@ export function buildWaterBodyFromGeocodeFeature(params: {
   type: WaterBodyType;
 }): WaterBody {
   const defaults = defaultDepthForType(params.type);
-  const rx = params.type === 'river' ? 0.012 : params.type === 'reservoir' ? 0.018 : 0.0055;
-  const ry = params.type === 'river' ? 0.004 : params.type === 'reservoir' ? 0.01 : 0.0038;
-  const polygon: [number, number][] =
-    params.type === 'river'
-      ? buildPolygonFromLineNodes([
-          { lat: params.lat - ry, lon: params.lng - rx },
-          { lat: params.lat, lon: params.lng },
-          { lat: params.lat + ry, lon: params.lng + rx },
-        ])
-      : [
-          [Number((params.lng - rx).toFixed(6)), Number((params.lat - ry).toFixed(6))],
-          [Number((params.lng + rx).toFixed(6)), Number((params.lat - ry).toFixed(6))],
-          [Number((params.lng + rx).toFixed(6)), Number((params.lat + ry).toFixed(6))],
-          [Number((params.lng - rx).toFixed(6)), Number((params.lat + ry).toFixed(6))],
-          [Number((params.lng - rx).toFixed(6)), Number((params.lat - ry).toFixed(6))],
-        ];
+  // Compact octagon marker when exact shoreline geometry is unavailable (never draw fake bounding-box rectangles over dry land)
+  const rLng = 0.0011;
+  const rLat = 0.0007;
+  const polygon: [number, number][] = [];
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    polygon.push([
+      Number((params.lng + Math.cos(a) * rLng).toFixed(5)),
+      Number((params.lat + Math.sin(a) * rLat).toFixed(5)),
+    ]);
+  }
+  polygon.push(polygon[0]);
 
   return {
     id: params.id,
@@ -760,6 +788,17 @@ interface OverpassElement {
   bounds?: { minlat: number; minlon: number; maxlat: number; maxlon: number };
 }
 
+interface NominatimLookupItem {
+  osm_type?: 'way' | 'relation' | 'node';
+  osm_id?: number;
+  lat?: string;
+  lon?: string;
+  geojson?: {
+    type?: 'Polygon' | 'MultiPolygon' | 'LineString' | 'MultiLineString' | 'Point';
+    coordinates?: unknown;
+  };
+}
+
 interface PhotonFeature {
   geometry?: { coordinates?: [number, number] };
   properties?: {
@@ -784,7 +823,87 @@ function isPhotonWaterFeature(props?: PhotonFeature['properties']): boolean {
   return ['river', 'stream', 'canal', 'lake', 'reservoir', 'pond', 'oxbow', 'basin'].includes(v);
 }
 
-function buildWaterBodyFromPhotonFeature(feat: PhotonFeature): WaterBody | null {
+function extractGeometryFromNominatim(
+  item: NominatimLookupItem,
+  anchor: LatLng,
+  type: WaterBodyType
+): { polygon: [number, number][]; polygon_rings?: [number, number][][]; center: LatLng } | null {
+  const g = item.geojson;
+  if (!g || !g.coordinates) return null;
+
+  const ensureClosed = (ring: [number, number][]): [number, number][] => {
+    const out = ring.slice(0, 250).map(([x, y]) => [Number(x.toFixed(5)), Number(y.toFixed(5))] as [number, number]);
+    if (out.length >= 3) {
+      const f = out[0];
+      const l = out[out.length - 1];
+      if (f[0] !== l[0] || f[1] !== l[1]) out.push([f[0], f[1]]);
+    }
+    return out;
+  };
+
+  if (g.type === 'Polygon') {
+    const coords = g.coordinates as [number, number][][];
+    if (!Array.isArray(coords) || coords.length === 0 || coords[0].length < 4) return null;
+    const rings = coords.map(ensureClosed).filter((r) => r.length >= 4);
+    if (rings.length === 0) return null;
+    const center = findInteriorWaterPoint(rings, anchor);
+    return {
+      polygon: rings[0],
+      ...(rings.length > 1 ? { polygon_rings: rings } : {}),
+      center,
+    };
+  }
+
+  if (g.type === 'MultiPolygon') {
+    const polys = g.coordinates as [number, number][][][];
+    if (!Array.isArray(polys) || polys.length === 0) return null;
+    const main = polys.slice().sort((a, b) => (b[0]?.length ?? 0) - (a[0]?.length ?? 0))[0];
+    if (!main || main.length === 0 || main[0].length < 4) return null;
+    const rings = main.map(ensureClosed).filter((r) => r.length >= 4);
+    if (rings.length === 0) return null;
+    const center = findInteriorWaterPoint(rings, anchor);
+    return {
+      polygon: rings[0],
+      ...(rings.length > 1 ? { polygon_rings: rings } : {}),
+      center,
+    };
+  }
+
+  if (g.type === 'LineString' || g.type === 'MultiLineString') {
+    const rawLines =
+      g.type === 'LineString'
+        ? [g.coordinates as [number, number][]]
+        : (g.coordinates as [number, number][][]);
+    // Pick the segment closest to anchor, clipped within 14 km so it stays focused
+    let bestLine: [number, number][] = [];
+    let bestDist = Infinity;
+    for (const line of rawLines) {
+      const nearPts = line.filter((pt) => haversineMeters(anchor, { lat: pt[1], lng: pt[0] }) <= 14000);
+      const candidate = nearPts.length >= 2 ? nearPts : line;
+      for (const pt of candidate) {
+        const d = haversineMeters(anchor, { lat: pt[1], lng: pt[0] });
+        if (d < bestDist) {
+          bestDist = d;
+          bestLine = candidate;
+        }
+      }
+    }
+    if (bestLine.length >= 2) {
+      const buf = buildPolygonFromLineNodes(
+        bestLine.map(([lon, lat]) => ({ lat, lon })),
+        type === 'river' ? 28 : 18
+      );
+      return { polygon: buf.polygon, center: buf.center };
+    }
+  }
+
+  return null;
+}
+
+function buildWaterBodyFromPhotonFeature(
+  feat: PhotonFeature,
+  nomMap: Map<string, NominatimLookupItem>
+): WaterBody | null {
   const coords = feat.geometry?.coordinates;
   const props = feat.properties;
   if (!coords || coords.length < 2 || !props?.name || !isPhotonWaterFeature(props)) return null;
@@ -802,52 +921,42 @@ function buildWaterBodyFromPhotonFeature(feat: PhotonFeature): WaterBody | null 
   const defaults = defaultDepthForType(type);
 
   let areaHa = defaults.area;
-  let polygon: [number, number][] | null = null;
   if (Array.isArray(props.extent) && props.extent.length === 4) {
     const [minLon, maxLat, maxLon, minLat] = props.extent;
-    const spanLon = Math.min(0.28, Math.max(0.004, Math.abs(maxLon - minLon)));
-    const spanLat = Math.min(0.18, Math.max(0.003, Math.abs(maxLat - minLat)));
+    const spanLon = Math.min(0.28, Math.max(0.002, Math.abs(maxLon - minLon)));
+    const spanLat = Math.min(0.18, Math.max(0.0015, Math.abs(maxLat - minLat)));
     const dLatKm = spanLat * 111;
     const dLngKm = spanLon * 111 * Math.cos((lat * Math.PI) / 180);
     const approxHa = Math.round(dLatKm * dLngKm * (type === 'river' ? 12 : 45));
     if (approxHa >= 1 && approxHa <= 50000) areaHa = approxHa;
-
-    const halfLon = Math.min(0.035, Math.max(0.0035, spanLon / 2));
-    const halfLat = Math.min(0.022, Math.max(0.0022, spanLat / 2));
-    if (type === 'river') {
-      polygon = buildPolygonFromLineNodes([
-        { lat: lat - halfLat * 0.7, lon: lng - halfLon * 0.8 },
-        { lat, lon: lng },
-        { lat: lat + halfLat * 0.7, lon: lng + halfLon * 0.8 },
-      ]);
-    } else {
-      polygon = [
-        [Number((lng - halfLon).toFixed(6)), Number((lat - halfLat).toFixed(6))],
-        [Number((lng + halfLon).toFixed(6)), Number((lat - halfLat).toFixed(6))],
-        [Number((lng + halfLon).toFixed(6)), Number((lat + halfLat).toFixed(6))],
-        [Number((lng - halfLon).toFixed(6)), Number((lat + halfLat).toFixed(6))],
-        [Number((lng - halfLon).toFixed(6)), Number((lat - halfLat).toFixed(6))],
-      ];
-    }
   }
+
+  const osmTagKey = `${(props.osm_type ?? 'W').toUpperCase()}${props.osm_id ?? ''}`;
+  const nomItem = props.osm_id ? nomMap.get(osmTagKey) : undefined;
+  const extracted = nomItem ? extractGeometryFromNominatim(nomItem, { lat, lng }, type) : null;
 
   const region = [props.state, props.county].filter(Boolean).slice(0, 2).join(' · ') || 'OpenStreetMap';
   const osmTagId = `${props.osm_type ?? 'W'}${props.osm_id ?? `${lat.toFixed(4)}-${lng.toFixed(4)}`}`;
+  const center = extracted?.center ?? { lat: Number(lat.toFixed(5)), lng: Number(lng.toFixed(5)) };
+
   const base = buildWaterBodyFromGeocodeFeature({
     id: `wb-osm-${osmTagId}`,
     title: props.name.trim(),
     subtitle: region,
-    lat,
-    lng,
+    lat: center.lat,
+    lng: center.lng,
     type,
   });
 
   return {
     ...base,
-    polygon: polygon ?? base.polygon,
+    center,
+    target_zone: center,
+    polygon: extracted?.polygon ?? base.polygon,
+    ...(extracted?.polygon_rings ? { polygon_rings: extracted.polygon_rings } : {}),
     area_ha: areaHa,
     external_id: `OSM-${osmTagId}`,
-    confidence: 0.85,
+    confidence: extracted ? 0.9 : 0.8,
   };
 }
 
@@ -867,6 +976,35 @@ async function fetchPhotonFeatures(url: string, timeoutMs = 3500): Promise<Photo
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchNominatimLookup(osmIds: string[]): Promise<Map<string, NominatimLookupItem>> {
+  const map = new Map<string, NominatimLookupItem>();
+  if (osmIds.length === 0) return map;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3200);
+  try {
+    const url = `https://nominatim.openstreetmap.org/lookup?osm_ids=${osmIds.slice(0, 18).join(',')}&format=jsonv2&polygon_geojson=1&polygon_threshold=0.0005`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'FishCastAI/1.0' },
+      signal: controller.signal,
+    });
+    if (!res.ok) return map;
+    const items = (await res.json()) as NominatimLookupItem[];
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (item.osm_type && item.osm_id) {
+          const prefix = item.osm_type === 'relation' ? 'R' : item.osm_type === 'way' ? 'W' : 'N';
+          map.set(`${prefix}${item.osm_id}`, item);
+        }
+      }
+    }
+  } catch {
+    // Graceful fallback if Nominatim unreachable
+  } finally {
+    clearTimeout(timer);
+  }
+  return map;
 }
 
 export async function discoverOsmWaterBodies(params: {
@@ -889,7 +1027,7 @@ export async function discoverOsmWaterBodies(params: {
     );
   }
 
-  // 2) Optional Overpass exact-geometry enrichment (fast 2.8s cap so UI stays snappy)
+  // 2) Optional Overpass exact-geometry enrichment (fast 2.8s cap)
   const overpassPromise = (async (): Promise<OverpassElement[]> => {
     const radiusM = Math.min(18000, radiusKm * 1000);
     const qlLines = [
@@ -928,6 +1066,24 @@ export async function discoverOsmWaterBodies(params: {
     overpassPromise,
   ]);
 
+  // Batch-enrich Photon water features with exact Nominatim polygon/line GeoJSONs
+  const osmIdsToLookup: string[] = [];
+  const seenLookupIds = new Set<string>();
+  for (const batch of photonBatches) {
+    for (const feat of batch) {
+      const p = feat.properties;
+      if (!isPhotonWaterFeature(p) || !p?.osm_id) continue;
+      const t = (p.osm_type ?? '').toUpperCase();
+      if (t !== 'W' && t !== 'R') continue;
+      const key = `${t}${p.osm_id}`;
+      if (!seenLookupIds.has(key)) {
+        seenLookupIds.add(key);
+        osmIdsToLookup.push(key);
+      }
+    }
+  }
+  const nomMap = await fetchNominatimLookup(osmIdsToLookup);
+
   const deduped = new Map<string, { wb: WaterBody; dist: number }>();
   const addCandidate = (wb: WaterBody) => {
     const nameKey = wb.display_label.toLowerCase();
@@ -964,29 +1120,36 @@ export async function discoverOsmWaterBodies(params: {
       }
     }
 
-    const polygon =
-      type === 'river' && geom
-        ? buildPolygonFromLineNodes(geom)
-        : geom && geom.length >= 4
-          ? buildClosedPolygonFromNodes(geom)
-          : buildWaterBodyFromGeocodeFeature({
-              id: `wb-osm-${el.type}-${el.id}`,
-              title: rawName,
-              lat: centerLat,
-              lng: centerLng,
-              type,
-            }).polygon;
+    let polygon: [number, number][];
+    let interiorCenter: LatLng = { lat: Number(centerLat.toFixed(5)), lng: Number(centerLng.toFixed(5)) };
+
+    if (type === 'river' && geom) {
+      const buf = buildPolygonFromLineNodes(geom, 28);
+      polygon = buf.polygon;
+      interiorCenter = buf.center;
+    } else if (geom && geom.length >= 4) {
+      polygon = buildClosedPolygonFromNodes(geom);
+      interiorCenter = findInteriorWaterPoint([polygon], interiorCenter);
+    } else {
+      polygon = buildWaterBodyFromGeocodeFeature({
+        id: `wb-osm-${el.type}-${el.id}`,
+        title: rawName,
+        lat: centerLat,
+        lng: centerLng,
+        type,
+      }).polygon;
+    }
 
     addCandidate({
       id: `wb-osm-${el.type}-${el.id}`,
       name: rawName,
       display_label: rawName,
       type,
-      center: { lat: Number(centerLat.toFixed(5)), lng: Number(centerLng.toFixed(5)) },
+      center: interiorCenter,
       polygon,
       area_ha: areaHa,
       source: 'osm',
-      confidence: 0.88,
+      confidence: 0.9,
       moderation_status: 'verified',
       connected_to: null,
       has_bathymetry: false,
@@ -997,13 +1160,13 @@ export async function discoverOsmWaterBodies(params: {
       ndwi_stability: 'year_round',
       vegetation_index: 'moderate',
       water_clarity: 'moderate',
-      target_zone: { lat: Number(centerLat.toFixed(5)), lng: Number(centerLng.toFixed(5)) },
+      target_zone: interiorCenter,
     });
   }
 
   for (const batch of photonBatches) {
     for (const feat of batch) {
-      const wb = buildWaterBodyFromPhotonFeature(feat);
+      const wb = buildWaterBodyFromPhotonFeature(feat, nomMap);
       if (wb) addCandidate(wb);
     }
   }

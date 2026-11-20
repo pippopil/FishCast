@@ -14,7 +14,7 @@ export const PRESET_MAP_REGIONS: PresetMapRegion[] = [
   {
     id: 'region-istra',
     name: 'Истринское вдхр. и р. Истра',
-    description: 'Истринское вдхр., Бужарово, Лучинское и карьеры Сычёво',
+    description: 'Истринское вдхр., Бужарово, Лучинское и плёсы р. Истра',
     bbox: { north: 56.08, south: 55.89, east: 36.93, west: 36.68 },
   },
   {
@@ -26,8 +26,8 @@ export const PRESET_MAP_REGIONS: PresetMapRegion[] = [
   {
     id: 'region-west-reservoirs',
     name: 'Озернинское, Рузское и Можайское',
-    description: 'Западный каскад водохранилищ для дальних выездов',
-    bbox: { north: 55.94, south: 55.52, east: 36.42, west: 35.72 },
+    description: 'Западный каскад водохранилищ и карьеры у д. Сычёво',
+    bbox: { north: 56.00, south: 55.52, east: 36.42, west: 35.72 },
   },
 ];
 

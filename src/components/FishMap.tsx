@@ -324,7 +324,8 @@ export const FishMap: React.FC<FishMapProps> = ({
         },
         geometry: {
           type: 'Polygon' as const,
-          coordinates: [wb.polygon],
+          coordinates:
+            wb.polygon_rings && wb.polygon_rings.length > 0 ? wb.polygon_rings : [wb.polygon],
         },
       })),
     };

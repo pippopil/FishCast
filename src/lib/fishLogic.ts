@@ -29,6 +29,107 @@ export function haversineMeters(a: LatLng, b: LatLng): number {
   return 2 * R * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 }
 
+export function pointInRing(point: LatLng, ring: [number, number][]): boolean {
+  if (!ring || ring.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0];
+    const yi = ring[i][1];
+    const xj = ring[j][0];
+    const yj = ring[j][1];
+    const intersect =
+      yi > point.lat !== yj > point.lat &&
+      point.lng < ((xj - xi) * (point.lat - yi)) / (yj - yi || 1e-16) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+export function pointInWaterBody(
+  point: LatLng,
+  wb: Pick<WaterBody, 'polygon' | 'polygon_rings'>
+): boolean {
+  const rings = wb.polygon_rings && wb.polygon_rings.length > 0 ? wb.polygon_rings : [wb.polygon];
+  if (rings.length === 0 || !pointInRing(point, rings[0])) return false;
+  for (let i = 1; i < rings.length; i++) {
+    if (pointInRing(point, rings[i])) return false;
+  }
+  return true;
+}
+
+export function distToWaterBoundaryMeters(
+  point: LatLng,
+  rings: [number, number][][]
+): number {
+  const cosLat = Math.cos((point.lat * Math.PI) / 180) || 1;
+  const kx = 111320 * cosLat;
+  const ky = 110540;
+  let minSq = Infinity;
+  for (const ring of rings) {
+    for (let i = 0; i < ring.length - 1; i++) {
+      const ax = (ring[i][0] - point.lng) * kx;
+      const ay = (ring[i][1] - point.lat) * ky;
+      const bx = (ring[i + 1][0] - point.lng) * kx;
+      const by = (ring[i + 1][1] - point.lat) * ky;
+      const dx = bx - ax;
+      const dy = by - ay;
+      const lenSq = dx * dx + dy * dy;
+      const t = lenSq > 0 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / lenSq)) : 0;
+      const px = ax + t * dx;
+      const py = ay + t * dy;
+      const dSq = px * px + py * py;
+      if (dSq < minSq) minSq = dSq;
+    }
+  }
+  return Math.sqrt(minSq);
+}
+
+export function findInteriorWaterPoint(
+  rings: [number, number][][],
+  prefer?: LatLng
+): LatLng {
+  const outer = rings[0];
+  if (!outer || outer.length === 0) {
+    return prefer ?? { lat: 55.975, lng: 36.825 };
+  }
+  if (prefer && pointInWaterBody(prefer, { polygon: outer, polygon_rings: rings })) {
+    if (distToWaterBoundaryMeters(prefer, rings) >= 40) {
+      return { lat: Number(prefer.lat.toFixed(5)), lng: Number(prefer.lng.toFixed(5)) };
+    }
+  }
+  let minLng = Infinity;
+  let maxLng = -Infinity;
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  for (const [lng, lat] of outer) {
+    if (lng < minLng) minLng = lng;
+    if (lng > maxLng) maxLng = lng;
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+  }
+  const grid = 28;
+  let best: { lat: number; lng: number; score: number } | null = null;
+  for (let i = 0; i <= grid; i++) {
+    for (let j = 0; j <= grid; j++) {
+      const lng = minLng + (maxLng - minLng) * (i / grid);
+      const lat = minLat + (maxLat - minLat) * (j / grid);
+      const candidate = { lat, lng };
+      if (!pointInWaterBody(candidate, { polygon: outer, polygon_rings: rings })) continue;
+      const clearance = distToWaterBoundaryMeters(candidate, rings);
+      const prefPenalty = prefer ? haversineMeters(candidate, prefer) * 0.04 : 0;
+      const score = clearance - prefPenalty;
+      if (!best || score > best.score) {
+        best = { lat, lng, score };
+      }
+    }
+  }
+  if (best) {
+    return { lat: Number(best.lat.toFixed(5)), lng: Number(best.lng.toFixed(5)) };
+  }
+  if (prefer) return prefer;
+  return { lat: Number(outer[0][1].toFixed(5)), lng: Number(outer[0][0].toFixed(5)) };
+}
+
 export function windDegreesToLabel(deg: number): string {
   const dirs = ['С', 'СВ', 'В', 'ЮВ', 'Ю', 'ЮЗ', 'З', 'СЗ'];
   const idx = Math.round((((deg % 360) + 360) % 360) / 45) % 8;
