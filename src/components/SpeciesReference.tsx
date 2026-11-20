@@ -1,13 +1,17 @@
 import React, { useMemo, useState } from 'react';
-import { BookOpen, Fish } from 'lucide-react';
+import { BookOpen, CheckCircle2, Database, Fish, RefreshCw } from 'lucide-react';
 import { recommendLures, waterBodyTypeRu } from '../lib/fishLogic';
 import type { FishSpecies, KnotGuide, WaterBody } from '../lib/types';
+import type { KnotsCacheMeta } from '../utils/offlineDb';
 
 interface SpeciesReferenceProps {
   speciesList: FishSpecies[];
   knotsList: KnotGuide[];
   waterBodies: WaterBody[];
   selectedWaterBody: WaterBody | null;
+  knotsCacheMeta?: KnotsCacheMeta | null;
+  isOnline?: boolean;
+  onRefreshKnotsCache?: () => Promise<void>;
 }
 
 const MONTHS_RU = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
@@ -59,11 +63,15 @@ export const SpeciesReference: React.FC<SpeciesReferenceProps> = ({
   knotsList,
   waterBodies,
   selectedWaterBody,
+  knotsCacheMeta = null,
+  isOnline = true,
+  onRefreshKnotsCache,
 }) => {
   const [section, setSection] = useState<'species' | 'knots'>('species');
   const [activeSpeciesId, setActiveSpeciesId] = useState(speciesList[0]?.id ?? 'pike');
   const [contextWbId, setContextWbId] = useState(selectedWaterBody?.id ?? waterBodies[0]?.id ?? '');
   const [knotQuery, setKnotQuery] = useState('');
+  const [refreshingKnots, setRefreshingKnots] = useState(false);
 
   const activeSpecies = speciesList.find((s) => s.id === activeSpeciesId) ?? speciesList[0];
   const contextWb = waterBodies.find((w) => w.id === contextWbId) ?? null;
@@ -277,6 +285,51 @@ export const SpeciesReference: React.FC<SpeciesReferenceProps> = ({
 
       {section === 'knots' && (
         <div className="mt-6 space-y-4">
+          {/* IndexedDB Offline Cache Status Bar */}
+          <div
+            data-testid="knots-offline-cache-bar"
+            className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-xs dark:border-slate-800 dark:bg-slate-900"
+          >
+            <div className="flex flex-wrap items-center gap-2 text-slate-700 dark:text-slate-300">
+              <Database className="h-4 w-4 text-teal-600 dark:text-teal-400 shrink-0" aria-hidden="true" />
+              <span className="font-semibold text-slate-900 dark:text-slate-100">
+                Справочник узлов кэширован в IndexedDB
+              </span>
+              <span className="inline-flex items-center gap-1 font-mono text-[11px] text-teal-700 dark:text-teal-400 tabular-nums">
+                <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                {knotsCacheMeta?.count ?? knotsList.length} узлов доступно офлайн
+              </span>
+              {knotsCacheMeta?.cached_at && (
+                <span className="text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                  · обновлено{' '}
+                  {new Date(knotsCacheMeta.cached_at).toLocaleTimeString('ru-RU', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  })}
+                </span>
+              )}
+            </div>
+
+            {onRefreshKnotsCache && (
+              <button
+                type="button"
+                disabled={!isOnline || refreshingKnots}
+                onClick={async () => {
+                  setRefreshingKnots(true);
+                  try {
+                    await onRefreshKnotsCache();
+                  } finally {
+                    setRefreshingKnots(false);
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${refreshingKnots ? 'animate-spin' : ''}`} aria-hidden="true" />
+                {isOnline ? (refreshingKnots ? 'Обновляем...' : 'Обновить кэш') : 'Офлайн-режим'}
+              </button>
+            )}
+          </div>
+
           <div>
             <label htmlFor="knot-search" className="sr-only">
               Поиск узла или оснастки
@@ -284,7 +337,7 @@ export const SpeciesReference: React.FC<SpeciesReferenceProps> = ({
             <input
               id="knot-search"
               type="search"
-              placeholder="Поиск узла: Паломар, Клинч, Олбрайт, Патерностер..."
+              placeholder="Поиск узла: Паломар, Клинч, Олбрайт, Юни, Патерностер..."
               value={knotQuery}
               onChange={(e) => setKnotQuery(e.target.value)}
               className="w-full max-w-md rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"

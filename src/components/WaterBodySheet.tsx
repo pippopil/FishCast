@@ -3,8 +3,10 @@ import {
   Anchor,
   Bell,
   Car,
+  CheckCircle2,
   Compass,
   ExternalLink,
+  Fish,
   Footprints,
   Navigation2,
   Radar,
@@ -20,6 +22,9 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
+  Line,
+  LineChart,
+  ReferenceDot,
   ReferenceLine,
   ResponsiveContainer,
   Tooltip,
@@ -28,6 +33,7 @@ import {
 } from 'recharts';
 import {
   buildBathymetryProfile,
+  getExpectedFishForWaterBody,
   waterBodyTypeRu,
   type BathymetryProfileLineMode,
   type BathymetryProfilePoint,
@@ -35,6 +41,8 @@ import {
 import type {
   BathymetryPoint,
   BiteForecastResponse,
+  BiteForecastSlot,
+  CatchReport,
   FishSpecies,
   LatLng,
   LureRecommendationResult,
@@ -51,6 +59,7 @@ interface WaterBodySheetProps {
   forecast: BiteForecastResponse | null;
   forecastLoading: boolean;
   speciesList: FishSpecies[];
+  reports?: CatchReport[];
   selectedFishId: string;
   onSelectFishId: (id: string) => void;
   recommendations: LureRecommendationResult[];
@@ -76,6 +85,7 @@ interface WaterBodySheetProps {
 }
 
 type DetailSubTab = 'forecast' | 'depth' | 'route';
+type ChartSlotPoint = BiteForecastSlot & { slotKey: string; chartLabel: string };
 
 const SOURCE_LABELS: Record<WaterBody['source'], string> = {
   registry: 'Госводреестр',
@@ -84,12 +94,19 @@ const SOURCE_LABELS: Record<WaterBody['source'], string> = {
   user: 'Краудсорсинг',
 };
 
+const ABUNDANCE_LABELS: Record<'common' | 'regular' | 'rare', string> = {
+  common: 'основная',
+  regular: 'обычная',
+  rare: 'редко',
+};
+
 export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
   waterBody,
   weather,
   forecast,
   forecastLoading,
   speciesList,
+  reports = [],
   selectedFishId,
   onSelectFishId,
   recommendations,
@@ -114,13 +131,28 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
   isOnline = true,
 }) => {
   const [subTab, setSubTab] = useState<DetailSubTab>('forecast');
-  const [selectedDay, setSelectedDay] = useState<'Сегодня' | 'Завтра' | 'Послезавтра'>('Сегодня');
-  const [selectedHourInterval, setSelectedHourInterval] = useState<string | null>(null);
+  const [selectedDay, setSelectedDay] = useState<'Ближ. 24ч' | 'Завтра' | 'Послезавтра'>('Ближ. 24ч');
+  const [selectedSlotKey, setSelectedSlotKey] = useState<string | null>(null);
   const [profileLineMode, setProfileLineMode] = useState<BathymetryProfileLineMode>('transect');
   const [depthVal, setDepthVal] = useState('4.5');
   const [depthSource, setDepthSource] = useState<'manual' | 'sonar'>('manual');
   const [depthError, setDepthError] = useState<string | null>(null);
   const [depthSavedMsg, setDepthSavedMsg] = useState<string | null>(null);
+
+  const expectedFish = useMemo(
+    () => getExpectedFishForWaterBody({ waterBody, speciesList, reports }),
+    [waterBody, speciesList, reports]
+  );
+
+  const selectedExpectedFish = useMemo(
+    () => expectedFish.find((f) => f.species_id === selectedFishId) ?? null,
+    [expectedFish, selectedFishId]
+  );
+
+  const selectedSpeciesObj = useMemo(
+    () => speciesList.find((s) => s.id === selectedFishId) ?? speciesList[0],
+    [speciesList, selectedFishId]
+  );
 
   const profileData = useMemo(
     () => buildBathymetryProfile(depthPoints, profileLineMode),
@@ -136,13 +168,52 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
     return { maxD, avgD, spanM, domainBottom };
   }, [profileData]);
 
-  const daySlots = (forecast?.slots ?? []).filter((s) => s.day_label === selectedDay);
-  const peakSlot = daySlots.reduce(
+  const chartSlots = useMemo<ChartSlotPoint[]>(() => {
+    const allSlots = forecast?.slots ?? [];
+    if (allSlots.length === 0) return [];
+
+    let rawSlice: BiteForecastSlot[];
+    if (selectedDay === 'Ближ. 24ч') {
+      const currentBlock = Math.floor(new Date().getHours() / 3) * 3;
+      const targetHour = `${currentBlock.toString().padStart(2, '0')}:00`;
+      const startIdx = allSlots.findIndex(
+        (s) => s.day_label === 'Сегодня' && s.hour_interval === targetHour
+      );
+      if (startIdx >= 0 && startIdx + 8 <= allSlots.length) {
+        rawSlice = allSlots.slice(startIdx, startIdx + 8);
+      } else {
+        rawSlice = allSlots.filter((s) => s.day_label === 'Сегодня').slice(0, 8);
+      }
+    } else {
+      rawSlice = allSlots.filter((s) => s.day_label === selectedDay).slice(0, 8);
+    }
+
+    const firstDate = rawSlice[0]?.date;
+    return rawSlice.map((s) => ({
+      ...s,
+      slotKey: `${s.date}_${s.hour_interval}`,
+      chartLabel:
+        selectedDay === 'Ближ. 24ч' && s.date !== firstDate && s.hour_interval === '00:00'
+          ? '00:00*'
+          : s.hour_interval,
+    }));
+  }, [forecast?.slots, selectedDay]);
+
+  const peakSlot: ChartSlotPoint = chartSlots.reduce(
     (best, cur) => (cur.f_index > best.f_index ? cur : best),
-    daySlots[0] ?? { f_index: 0, probability_label: 'средняя вероятность' as const, hour_interval: '06:00', factors: [] }
+    chartSlots[0] ?? {
+      date: '',
+      day_label: 'Сегодня',
+      hour_interval: '06:00',
+      f_index: 0,
+      probability_label: 'средняя вероятность' as const,
+      factors: [],
+      slotKey: '_06:00',
+      chartLabel: '06:00',
+    }
   );
   const activeSlot =
-    daySlots.find((s) => s.hour_interval === selectedHourInterval) ?? peakSlot;
+    chartSlots.find((s) => s.slotKey === selectedSlotKey) ?? peakSlot;
 
   const handleDepthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -356,11 +427,86 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
               </div>
             )}
 
+            {/* Expected Fish Species in this Water Body */}
+            {expectedFish.length > 0 && (
+              <div
+                data-testid="water-body-inhabiting-species"
+                className="rounded-2xl border border-slate-200 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-900 dark:text-slate-100">
+                    <Fish className="h-4 w-4 text-sky-700 dark:text-sky-400" aria-hidden="true" />
+                    Какая рыба водится в водоёме
+                  </h3>
+                  <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                    {expectedFish.length} вид.
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                  Нажмите на вид, чтобы построить график клёва и приманки именно под него.
+                </p>
+
+                <div className="mt-2.5 flex flex-wrap gap-1.5">
+                  {expectedFish.map((item) => {
+                    const isSelected = item.species_id === selectedFishId;
+                    return (
+                      <button
+                        key={item.species_id}
+                        type="button"
+                        onClick={() => onSelectFishId(item.species_id)}
+                        title={
+                          item.note
+                            ? `${item.species_name} (${ABUNDANCE_LABELS[item.abundance]}): ${item.note}`
+                            : `${item.species_name} (${ABUNDANCE_LABELS[item.abundance]})`
+                        }
+                        className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
+                          isSelected
+                            ? 'border-sky-700 bg-sky-700 text-white'
+                            : item.abundance === 'common'
+                              ? 'border-slate-200 bg-slate-50 text-slate-800 hover:border-sky-400 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100'
+                              : 'border-slate-200/80 bg-white text-slate-600 hover:border-sky-400 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300'
+                        }`}
+                      >
+                        {item.source === 'confirmed_report' && (
+                          <CheckCircle2
+                            className={`h-3 w-3 shrink-0 ${isSelected ? 'text-sky-100' : 'text-teal-600 dark:text-teal-400'}`}
+                            aria-hidden="true"
+                          />
+                        )}
+                        <span>{item.species_name}</span>
+                        <span
+                          className={`text-[10px] ${
+                            isSelected ? 'text-sky-100' : 'text-slate-400 dark:text-slate-500'
+                          }`}
+                        >
+                          · {ABUNDANCE_LABELS[item.abundance]}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {selectedExpectedFish?.note ? (
+                  <p className="mt-2 text-[11px] text-slate-600 dark:text-slate-300">
+                    <span className="font-semibold text-slate-800 dark:text-slate-100">
+                      {selectedExpectedFish.species_name}:
+                    </span>{' '}
+                    {selectedExpectedFish.note}
+                    {selectedExpectedFish.source === 'confirmed_report' ? ' · подтверждено уловами' : ''}
+                  </p>
+                ) : !selectedExpectedFish && selectedSpeciesObj ? (
+                  <p className="mt-2 rounded-lg bg-amber-50 px-2.5 py-1.5 text-[11px] text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+                    «{selectedSpeciesObj.name}» нетипичен для этого водоёма — выберите один из обитающих видов выше.
+                  </p>
+                ) : null}
+              </div>
+            )}
+
             {/* F-Index Bite Forecast */}
             <div>
               <div className="flex items-center justify-between gap-3">
                 <label htmlFor="wb-fish-select" className="text-xs font-bold text-slate-900 dark:text-slate-100">
-                  AI-прогноз клёва (F-Индекс)
+                  Прогноз клёва на 24 часа (F-Индекс)
                 </label>
                 <select
                   id="wb-fish-select"
@@ -378,13 +524,13 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
 
               {/* Day switcher */}
               <div className="mt-2.5 flex items-center gap-1.5">
-                {(['Сегодня', 'Завтра', 'Послезавтра'] as const).map((day) => (
+                {(['Ближ. 24ч', 'Завтра', 'Послезавтра'] as const).map((day) => (
                   <button
                     key={day}
                     type="button"
                     onClick={() => {
                       setSelectedDay(day);
-                      setSelectedHourInterval(null);
+                      setSelectedSlotKey(null);
                     }}
                     className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
                       selectedDay === day
@@ -403,7 +549,7 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                   <span className="text-sm font-bold text-slate-900 dark:text-slate-100">
                     Прогноз: {peakSlot.probability_label}
                   </span>
-                  <span className="font-mono text-sm font-bold text-sky-700 dark:text-sky-400 tabular-nums">
+                  <span className="font-mono text-sm font-bold text-teal-700 dark:text-teal-400 tabular-nums">
                     пик F-{peakSlot.f_index} в {peakSlot.hour_interval}
                   </span>
                 </div>
@@ -435,37 +581,122 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
 
                 {forecastLoading ? (
                   <div className="mt-4 text-xs text-slate-500">Обновляем прогноз...</div>
-                ) : (
+                ) : chartSlots.length > 0 ? (
                   <>
-                    <div className="mt-3 grid grid-cols-8 gap-1.5 items-end h-24">
-                      {daySlots.map((slot) => {
-                        const isSelected = activeSlot.hour_interval === slot.hour_interval;
-                        const barColor =
-                          slot.f_index >= 66
-                            ? 'bg-teal-600'
-                            : slot.f_index >= 40
-                              ? 'bg-sky-600'
-                              : 'bg-slate-400';
+                    {/* Recharts 24h F-Index Line Chart */}
+                    <div className="mt-3 h-[184px] w-full" data-testid="findex-24h-chart">
+                      <ResponsiveContainer width="100%" height={180}>
+                        <LineChart
+                          data={chartSlots}
+                          margin={{ top: 12, right: 12, left: -20, bottom: 2 }}
+                          onClick={(state) => {
+                            const idx = typeof state?.activeTooltipIndex === 'number' ? state.activeTooltipIndex : -1;
+                            if (idx >= 0 && chartSlots[idx]) {
+                              setSelectedSlotKey(chartSlots[idx].slotKey);
+                            }
+                          }}
+                        >
+                          <CartesianGrid strokeDasharray="3 3" stroke="#CBD5E1" strokeOpacity={0.45} />
+                          <XAxis
+                            dataKey="chartLabel"
+                            tick={{ fontSize: 10, fill: '#64748B' }}
+                            axisLine={{ stroke: '#CBD5E1' }}
+                            tickLine={false}
+                          />
+                          <YAxis
+                            domain={[0, 100]}
+                            ticks={[0, 40, 66, 100]}
+                            tick={{ fontSize: 10, fill: '#64748B' }}
+                            axisLine={false}
+                            tickLine={false}
+                          />
+                          <ReferenceLine
+                            y={66}
+                            stroke="#0D9488"
+                            strokeDasharray="4 3"
+                            strokeOpacity={0.75}
+                          />
+                          <Tooltip
+                            content={({ active, payload }) => {
+                              if (!active || !payload || payload.length === 0) return null;
+                              const pt = payload[0].payload as ChartSlotPoint;
+                              return (
+                                <div className="rounded-xl border border-slate-200 bg-white/95 px-3 py-2 text-[11px] shadow-md dark:border-slate-700 dark:bg-slate-900/95">
+                                  <div className="flex items-center justify-between gap-3">
+                                    <span className="font-mono font-bold text-slate-900 dark:text-slate-100">
+                                      {pt.day_label}, {pt.hour_interval}
+                                    </span>
+                                    <span
+                                      className={`font-mono font-bold tabular-nums ${
+                                        pt.f_index >= 66
+                                          ? 'text-teal-700 dark:text-teal-400'
+                                          : pt.f_index >= 40
+                                            ? 'text-sky-700 dark:text-sky-400'
+                                            : 'text-slate-500'
+                                      }`}
+                                    >
+                                      F-{pt.f_index}
+                                    </span>
+                                  </div>
+                                  <div className="mt-0.5 text-slate-600 dark:text-slate-300">
+                                    {pt.probability_label}
+                                  </div>
+                                  {typeof pt.temp_c === 'number' && (
+                                    <div className="mt-1 font-mono text-[10px] text-slate-500 tabular-nums">
+                                      {pt.temp_c}°C · {pt.wind_speed_ms} м/с · {pt.pressure_mmhg} мм · об.{' '}
+                                      {pt.cloud_cover_pct ?? 0}%
+                                    </div>
+                                  )}
+                                  {pt.factors.length > 0 && (
+                                    <div className="mt-1 max-w-[220px] text-[10px] text-slate-500 dark:text-slate-400">
+                                      {pt.factors.slice(0, 2).join(' · ')}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            }}
+                          />
+                          <Line
+                            type="monotone"
+                            dataKey="f_index"
+                            stroke="#0284C7"
+                            strokeWidth={2.5}
+                            dot={{ r: 3.5, fill: '#0284C7', stroke: '#FFFFFF', strokeWidth: 1.5 }}
+                            activeDot={{ r: 5.5, fill: '#0F172A', stroke: '#FFFFFF', strokeWidth: 2 }}
+                            isAnimationActive={false}
+                          />
+                          <ReferenceDot
+                            x={peakSlot.chartLabel}
+                            y={peakSlot.f_index}
+                            r={6}
+                            fill="#0D9488"
+                            stroke="#FFFFFF"
+                            strokeWidth={2}
+                          />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+
+                    {/* Compact clickable 3-hour slot strip for quick touch inspection */}
+                    <div className="mt-1.5 grid grid-cols-8 gap-1">
+                      {chartSlots.map((slot) => {
+                        const isSelected = activeSlot.slotKey === slot.slotKey;
+                        const isPeak = peakSlot.slotKey === slot.slotKey;
                         return (
                           <button
-                            key={slot.hour_interval}
+                            key={slot.slotKey}
                             type="button"
-                            onClick={() => setSelectedHourInterval(slot.hour_interval)}
-                            className={`flex flex-col items-center gap-1 h-full justify-end rounded-md px-0.5 transition-all ${
-                              isSelected ? 'ring-2 ring-sky-500/70 bg-sky-50/70 dark:bg-sky-950/30' : ''
+                            onClick={() => setSelectedSlotKey(slot.slotKey)}
+                            className={`rounded-md py-1 text-center font-mono text-[10px] tabular-nums transition-colors ${
+                              isSelected
+                                ? 'bg-sky-700 font-bold text-white'
+                                : isPeak
+                                  ? 'bg-teal-50 font-bold text-teal-800 dark:bg-teal-950/50 dark:text-teal-300'
+                                  : 'bg-slate-50 text-slate-600 hover:bg-slate-100 dark:bg-slate-800/70 dark:text-slate-300'
                             }`}
-                            title={`${slot.hour_interval}: F-${slot.f_index} (${slot.probability_label})`}
+                            title={`${slot.day_label} ${slot.hour_interval}: F-${slot.f_index}`}
                           >
-                            <span className="font-mono text-[10px] font-semibold text-slate-700 dark:text-slate-300 tabular-nums">
-                              {slot.f_index}
-                            </span>
-                            <div
-                              className={`w-full rounded-t-md transition-all ${barColor}`}
-                              style={{ height: `${Math.max(12, Math.round(slot.f_index * 0.62))}px` }}
-                            />
-                            <span className="font-mono text-[10px] text-slate-500 tabular-nums">
-                              {slot.hour_interval.slice(0, 2)}
-                            </span>
+                            {slot.hour_interval.slice(0, 2)}ч
                           </button>
                         );
                       })}
@@ -476,7 +707,7 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                       <div className="mt-3 border-t border-slate-100 pt-2.5 text-[11px] dark:border-slate-800">
                         <div className="flex flex-wrap items-center justify-between gap-1 text-slate-700 dark:text-slate-300">
                           <span className="font-semibold">
-                            Слот {activeSlot.hour_interval}: F-{activeSlot.f_index}
+                            Слот {activeSlot.day_label}, {activeSlot.hour_interval}: F-{activeSlot.f_index}
                           </span>
                           {typeof activeSlot.temp_c === 'number' && (
                             <span className="font-mono text-slate-500 tabular-nums">
@@ -492,6 +723,8 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                       </div>
                     )}
                   </>
+                ) : (
+                  <div className="mt-4 text-xs text-slate-500">Нет данных прогноза для выбранного интервала.</div>
                 )}
 
                 <p className="mt-2.5 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">

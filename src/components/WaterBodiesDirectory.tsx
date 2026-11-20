@@ -1,12 +1,22 @@
 import React, { useState } from 'react';
-import { Car, Compass, Footprints, Globe, Loader2, Plus, Search, Star, TrendingUp } from 'lucide-react';
-import { waterBodyTypeRu } from '../lib/fishLogic';
-import type { GoodBiteWaterBodyItem, LatLng, NearbyWaterBody, WaterBody, WaterBodyType } from '../lib/types';
+import { Car, Compass, Fish, Footprints, Globe, Loader2, Plus, Search, Star, TrendingUp } from 'lucide-react';
+import { getExpectedFishForWaterBody, waterBodyTypeRu } from '../lib/fishLogic';
+import type {
+  CatchReport,
+  FishSpecies,
+  GoodBiteWaterBodyItem,
+  LatLng,
+  NearbyWaterBody,
+  WaterBody,
+  WaterBodyType,
+} from '../lib/types';
 
 interface WaterBodiesDirectoryProps {
   nearbyItems: NearbyWaterBody[];
   goodBiteById: Record<string, GoodBiteWaterBodyItem>;
   goodBiteItems: GoodBiteWaterBodyItem[];
+  speciesList?: FishSpecies[];
+  reports?: CatchReport[];
   radiusKm: number;
   onChangeRadiusKm: (r: number) => void;
   includeUnnamed: boolean;
@@ -30,6 +40,8 @@ export const WaterBodiesDirectory: React.FC<WaterBodiesDirectoryProps> = ({
   nearbyItems,
   goodBiteById,
   goodBiteItems,
+  speciesList = [],
+  reports = [],
   radiusKm,
   onChangeRadiusKm,
   includeUnnamed,
@@ -60,10 +72,16 @@ export const WaterBodiesDirectory: React.FC<WaterBodiesDirectoryProps> = ({
     }
     const q = query.trim().toLowerCase();
     if (!q) return true;
+    const fishMatches =
+      speciesList.length > 0 &&
+      getExpectedFishForWaterBody({ waterBody: item.water_body, speciesList, reports }).some((f) =>
+        f.species_name.toLowerCase().includes(q)
+      );
     return (
       item.water_body.display_label.toLowerCase().includes(q) ||
       waterBodyTypeRu(item.water_body.type).toLowerCase().includes(q) ||
-      item.water_body.region.toLowerCase().includes(q)
+      item.water_body.region.toLowerCase().includes(q) ||
+      fishMatches
     );
   });
 
@@ -283,7 +301,7 @@ export const WaterBodiesDirectory: React.FC<WaterBodiesDirectoryProps> = ({
           <input
             id="wb-search"
             type="search"
-            placeholder="Поиск: река, озеро, карьер, старица..."
+            placeholder="Поиск: водоём, река, озеро или рыба (судак, голавль, карп...)"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             className="w-full rounded-xl border border-slate-200 bg-slate-50 py-2.5 pl-9 pr-3 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
@@ -409,6 +427,22 @@ export const WaterBodiesDirectory: React.FC<WaterBodiesDirectoryProps> = ({
                     </>
                   )}
                 </p>
+
+                {speciesList.length > 0 && (() => {
+                  const expected = getExpectedFishForWaterBody({ waterBody: wb, speciesList, reports });
+                  if (expected.length === 0) return null;
+                  const topNames = expected.slice(0, 6).map((f) => f.species_name).join(', ');
+                  const extra = expected.length > 6 ? ` +${expected.length - 6}` : '';
+                  return (
+                    <p className="mt-1.5 flex items-start gap-1.5 text-xs text-slate-600 dark:text-slate-300">
+                      <Fish className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sky-700 dark:text-sky-400" aria-hidden="true" />
+                      <span>
+                        <span className="font-semibold text-slate-700 dark:text-slate-200">Рыба:</span> {topNames}
+                        {extra}
+                      </span>
+                    </p>
+                  );
+                })()}
               </div>
 
               <button

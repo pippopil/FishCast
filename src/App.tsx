@@ -70,7 +70,7 @@ import type {
   WaterBodyType,
   WeatherSnapshot,
 } from './lib/types';
-import { offlineDb } from './utils/offlineDb';
+import { offlineDb, type KnotsCacheMeta } from './utils/offlineDb';
 
 const DEFAULT_ORIGIN: LatLng = { lat: 55.975, lng: 36.825 };
 const DEFAULT_ALERT_SETTINGS: BiteAlertSettings = {
@@ -92,6 +92,7 @@ export default function App() {
   const [selectedWaterBody, setSelectedWaterBody] = useState<WaterBody | null>(SEED_WATER_BODIES[0] ?? null);
   const [speciesList, setSpeciesList] = useState<FishSpecies[]>(SEED_SPECIES);
   const [knotsList, setKnotsList] = useState<KnotGuide[]>(SEED_KNOTS);
+  const [knotsCacheMeta, setKnotsCacheMeta] = useState<KnotsCacheMeta | null>(null);
   const [reports, setReports] = useState<CatchReport[]>(SEED_REPORTS);
   const [depthPoints, setDepthPoints] = useState<BathymetryPoint[]>([]);
   const [weather, setWeather] = useState<WeatherSnapshot | null>(null);
@@ -252,9 +253,11 @@ export default function App() {
       if (active) setSyncQueue(existingQueue);
 
       if (!isOnline) {
-        const [cachedWbs, cachedRef, cachedReports, cachedWeather, lastWb] = await Promise.all([
+        const [cachedWbs, cachedRef, cachedKnots, cachedKnotsMeta, cachedReports, cachedWeather, lastWb] = await Promise.all([
           offlineDb.getWaterBodies(),
           offlineDb.getSpeciesAndKnots(),
+          offlineDb.getKnotsCache(),
+          offlineDb.getKnotsCacheMeta(),
           offlineDb.getReportsCache(),
           offlineDb.getWeather(),
           offlineDb.getLastOpenedWaterBody(),
@@ -262,13 +265,19 @@ export default function App() {
         if (!active) return;
         const wbs = cachedWbs.length > 0 ? cachedWbs : SEED_WATER_BODIES;
         const sp = cachedRef.species.length > 0 ? cachedRef.species : SEED_SPECIES;
-        const kn = cachedRef.knots.length > 0 ? cachedRef.knots : SEED_KNOTS;
+        const kn = cachedKnots.length > 0 ? cachedKnots : cachedRef.knots.length > 0 ? cachedRef.knots : SEED_KNOTS;
         const reps = cachedReports.length > 0 ? cachedReports : SEED_REPORTS;
         setWaterBodies(wbs);
         setSpeciesList(sp);
         setKnotsList(kn);
         setReports(reps);
         setWeather(cachedWeather);
+        if (cachedKnotsMeta) {
+          setKnotsCacheMeta(cachedKnotsMeta);
+        } else {
+          const savedMeta = await offlineDb.saveKnotsCache(kn);
+          if (active) setKnotsCacheMeta(savedMeta);
+        }
         if (lastWb) {
           setSelectedWaterBody(lastWb.water_body);
           setDepthPoints(lastWb.depth_points);
@@ -281,17 +290,19 @@ export default function App() {
       }
 
       try {
-        const [wbRes, spRes, repRes, weatherRes, meRes] = await Promise.all([
+        const [wbRes, spRes, knotsRes, repRes, weatherRes, meRes] = await Promise.all([
           fetch(apiUrl('/api/v1/water-bodies?include_unnamed=true')),
           fetch(apiUrl('/api/v1/species')),
+          fetch(apiUrl('/api/v1/knots')),
           fetch(apiUrl('/api/v1/reports')),
           fetch(apiUrl(`/api/v1/weather?lat=${DEFAULT_ORIGIN.lat}&lng=${DEFAULT_ORIGIN.lng}`)),
           fetch(apiUrl('/api/v1/auth/me')),
         ]);
 
-        const [wbJson, spJson, repJson, weatherJson, meJson] = await Promise.all([
+        const [wbJson, spJson, knotsJson, repJson, weatherJson, meJson] = await Promise.all([
           wbRes.json(),
           spRes.json(),
+          knotsRes.ok ? knotsRes.json() : Promise.resolve({ items: null }),
           repRes.json(),
           weatherRes.json(),
           meRes.json(),
@@ -300,7 +311,10 @@ export default function App() {
         if (!active) return;
         const wbs: WaterBody[] = wbJson.items ?? [];
         const sp: FishSpecies[] = spJson.species ?? [];
-        const kn: KnotGuide[] = spJson.knots ?? [];
+        const kn: KnotGuide[] =
+          Array.isArray(knotsJson.items) && knotsJson.items.length > 0
+            ? knotsJson.items
+            : spJson.knots ?? [];
         const reps: CatchReport[] = repJson.items ?? [];
 
         setWaterBodies(wbs);
@@ -316,23 +330,25 @@ export default function App() {
           );
         }
 
-        await Promise.all([
+        const [, knotsMeta] = await Promise.all([
           offlineDb.saveWaterBodies(wbs),
           offlineDb.saveSpeciesAndKnots(sp, kn),
           offlineDb.saveReportsCache(reps),
           weatherJson.weather ? offlineDb.saveWeather(weatherJson.weather) : Promise.resolve(),
         ]);
+        if (active) setKnotsCacheMeta(knotsMeta);
       } catch {
         // Standalone Capacitor APK or unreachable server: use IndexedDB cache or embedded seed catalog
-        const [cachedWbs, cachedRef, cachedReports, cachedWeather] = await Promise.all([
+        const [cachedWbs, cachedRef, cachedKnots, cachedReports, cachedWeather] = await Promise.all([
           offlineDb.getWaterBodies(),
           offlineDb.getSpeciesAndKnots(),
+          offlineDb.getKnotsCache(),
           offlineDb.getReportsCache(),
           offlineDb.getWeather(),
         ]);
         const wbs = cachedWbs.length > 0 ? cachedWbs : SEED_WATER_BODIES;
         const sp = cachedRef.species.length > 0 ? cachedRef.species : SEED_SPECIES;
-        const kn = cachedRef.knots.length > 0 ? cachedRef.knots : SEED_KNOTS;
+        const kn = cachedKnots.length > 0 ? cachedKnots : cachedRef.knots.length > 0 ? cachedRef.knots : SEED_KNOTS;
         const reps = cachedReports.length > 0 ? cachedReports : SEED_REPORTS;
         const wx = cachedWeather ?? (await fetchOpenMeteoWeatherDirect(DEFAULT_ORIGIN.lat, DEFAULT_ORIGIN.lng));
 
@@ -344,12 +360,13 @@ export default function App() {
         setWeather(wx);
         setSelectedWaterBody((prev) => prev ?? wbs[0] ?? null);
 
-        await Promise.all([
+        const [, knotsMeta] = await Promise.all([
           offlineDb.saveWaterBodies(wbs),
           offlineDb.saveSpeciesAndKnots(sp, kn),
           offlineDb.saveReportsCache(reps),
           offlineDb.saveWeather(wx),
         ]);
+        if (active) setKnotsCacheMeta(knotsMeta);
       }
     }
     void bootstrap();
@@ -357,6 +374,33 @@ export default function App() {
       active = false;
     };
   }, [isOnline]);
+
+  const handleRefreshKnotsCache = useCallback(async () => {
+    if (!isOnline) {
+      const cached = await offlineDb.getKnotsCache();
+      if (cached.length > 0) setKnotsList(cached);
+      const meta = await offlineDb.getKnotsCacheMeta();
+      if (meta) setKnotsCacheMeta(meta);
+      return;
+    }
+    try {
+      const res = await fetch(apiUrl('/api/v1/knots'));
+      if (res.ok) {
+        const json = (await res.json()) as { items?: KnotGuide[] };
+        const items = Array.isArray(json.items) && json.items.length > 0 ? json.items : knotsList;
+        setKnotsList(items);
+        const meta = await offlineDb.saveKnotsCache(items);
+        setKnotsCacheMeta(meta);
+        showToast(`Справочник узлов (${meta.count}) обновлён и сохранён в IndexedDB для офлайн-режима.`);
+        return;
+      }
+    } catch {
+      // Fallback to caching current list
+    }
+    const meta = await offlineDb.saveKnotsCache(knotsList);
+    setKnotsCacheMeta(meta);
+    showToast(`Справочник узлов (${meta.count}) сохранён в IndexedDB.`);
+  }, [isOnline, knotsList, showToast]);
 
   // Fetch nearby list when radius, origin or includeUnnamed changes (with standalone fallback)
   useEffect(() => {
@@ -1519,6 +1563,7 @@ export default function App() {
                   forecast={forecast}
                   forecastLoading={forecastLoading}
                   speciesList={speciesList}
+                  reports={reports}
                   selectedFishId={selectedFishId}
                   onSelectFishId={setSelectedFishId}
                   recommendations={recommendations}
@@ -1554,6 +1599,7 @@ export default function App() {
                     forecast={forecast}
                     forecastLoading={forecastLoading}
                     speciesList={speciesList}
+                    reports={reports}
                     selectedFishId={selectedFishId}
                     onSelectFishId={setSelectedFishId}
                     recommendations={recommendations}
@@ -1594,6 +1640,8 @@ export default function App() {
             nearbyItems={nearbyItems}
             goodBiteById={goodBiteById}
             goodBiteItems={goodBiteItems}
+            speciesList={speciesList}
+            reports={reports}
             radiusKm={radiusKm}
             onChangeRadiusKm={setRadiusKm}
             includeUnnamed={includeUnnamed}
@@ -1621,6 +1669,9 @@ export default function App() {
             knotsList={knotsList}
             waterBodies={waterBodies}
             selectedWaterBody={selectedWaterBody}
+            knotsCacheMeta={knotsCacheMeta}
+            isOnline={isOnline}
+            onRefreshKnotsCache={handleRefreshKnotsCache}
           />
         )}
 

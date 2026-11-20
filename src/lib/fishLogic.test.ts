@@ -14,6 +14,7 @@ import {
   estimateWaterTempC,
   evaluateFIndexAlerts,
   evaluateGoodBiteWaterBodies,
+  getExpectedFishForWaterBody,
   pointInWaterBody,
   recommendLures,
   selectBestAccessPoint,
@@ -975,5 +976,76 @@ test('recommendLures boosts ice-fishing lures (балансир/мормышка
   assert.equal(iceRecs[0].lure.id, 'ice-balancer');
   assert.ok(iceRecs[0].reasons.some((r) => r.includes('подлёдной')));
 });
+
+test('all seed water bodies define valid inhabiting_species and getExpectedFishForWaterBody resolves catalog, reports, and ecological fallback', async () => {
+  const { SEED_KNOTS, SEED_SPECIES, SEED_WATER_BODIES } = await import('../data/seedData');
+  const speciesIds = new Set(SEED_SPECIES.map((s) => s.id));
+
+  assert.ok(SEED_KNOTS.length >= 8, `Expected at least 8 knots in encyclopedia, got ${SEED_KNOTS.length}`);
+  for (const wb of SEED_WATER_BODIES) {
+    assert.ok(
+      wb.inhabiting_species && wb.inhabiting_species.length >= 5,
+      `${wb.id} must have curated inhabiting_species`
+    );
+    for (const item of wb.inhabiting_species) {
+      assert.ok(speciesIds.has(item.species_id), `${wb.id} references unknown species ${item.species_id}`);
+    }
+  }
+
+  const istra = SEED_WATER_BODIES.find((w) => w.id === 'wb-istra-res')!;
+  const istraFish = getExpectedFishForWaterBody({
+    waterBody: istra,
+    speciesList: SEED_SPECIES,
+    reports: [
+      {
+        id: 'r-conf',
+        client_event_id: 'r-conf',
+        user_id: 'u-1',
+        author_nickname: 'Тест',
+        author_verified: true,
+        water_body_id: 'wb-istra-res',
+        water_body_name: istra.display_label,
+        lat: istra.center.lat,
+        lng: istra.center.lng,
+        created_at: '2026-11-18T08:00:00Z',
+        updated_at: '2026-11-18T08:00:00Z',
+        fish_species_id: 'sudak',
+        fish_species_name: 'Судак',
+        outcome: 'catch',
+        weight_kg: 1.5,
+        length_cm: 48,
+        bait: 'Джиг',
+        retrieve: 'Ступенька',
+        weather_summary: '',
+        photo_url: null,
+        notes: '',
+        visibility: 'public',
+        source: 'diary',
+      },
+    ],
+  });
+  assert.ok(istraFish.some((f) => f.species_id === 'sudak' && f.source === 'confirmed_report'));
+  assert.ok(istraFish.some((f) => f.species_id === 'lesh' && f.abundance === 'common'));
+  assert.equal(istraFish.some((f) => f.species_id === 'rotan'), false);
+
+  // Ecological fallback for newly discovered shallow summer-drying pond without curated catalog
+  const unknownShallowPond: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-osm-shallow',
+    inhabiting_species: undefined,
+    type: 'pond',
+    area_ha: 0.3,
+    max_depth_m: 0.6,
+    ndwi_stability: 'dries_summer',
+  };
+  const fallbackFish = getExpectedFishForWaterBody({
+    waterBody: unknownShallowPond,
+    speciesList: SEED_SPECIES,
+  });
+  assert.ok(fallbackFish.every((f) => f.source === 'ecological_model'));
+  assert.ok(fallbackFish.some((f) => f.species_id === 'karas'));
+  assert.equal(fallbackFish.some((f) => f.species_id === 'sudak'), false);
+});
+
 
 

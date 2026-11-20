@@ -538,9 +538,17 @@ async function startServer() {
     return res.json({ water_body_id: wb.id, access_points: accessPoints });
   });
 
-  // --- Species & Recommendations ---
+  // --- Species, Knots & Recommendations ---
   app.get('/api/v1/species', (_req, res) => {
     return res.json({ species: store.species, knots: store.knots });
+  });
+
+  app.get('/api/v1/knots', (_req, res) => {
+    return res.json({
+      items: store.knots,
+      total: store.knots.length,
+      updated_at: new Date().toISOString(),
+    });
   });
 
   app.get('/api/v1/recommendations', (req, res) => {

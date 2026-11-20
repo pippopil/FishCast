@@ -12,7 +12,12 @@ import type {
 } from '../lib/types';
 
 const DB_NAME = 'fishcast_offline_v1';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
+
+export interface KnotsCacheMeta {
+  count: number;
+  cached_at: string;
+}
 
 export interface StoredMapTile {
   url: string;
@@ -54,6 +59,10 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains('map_tiles')) {
         const tileStore = db.createObjectStore('map_tiles', { keyPath: 'url' });
         tileStore.createIndex('by_zoom', 'z', { unique: false });
+      }
+      if (!db.objectStoreNames.contains('knots')) {
+        const knotsStore = db.createObjectStore('knots', { keyPath: 'id' });
+        knotsStore.createIndex('by_difficulty', 'difficulty', { unique: false });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -97,16 +106,80 @@ export const offlineDb = {
     return (await kvGet<WaterBody[]>('water_bodies')) ?? [];
   },
 
-  async saveSpeciesAndKnots(species: FishSpecies[], knots: KnotGuide[]): Promise<void> {
+  async saveKnotsCache(knots: KnotGuide[]): Promise<KnotsCacheMeta> {
+    const meta: KnotsCacheMeta = {
+      count: knots.length,
+      cached_at: new Date().toISOString(),
+    };
+    try {
+      const db = await openDb();
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(['knots', 'kv'], 'readwrite');
+        const knotsStore = tx.objectStore('knots');
+        knotsStore.clear();
+        for (const knot of knots) {
+          knotsStore.put(knot);
+        }
+        const kvStore = tx.objectStore('kv');
+        kvStore.put(knots, 'knots');
+        kvStore.put(meta, 'knots_cache_meta');
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch {
+      await kvSet('knots', knots);
+      await kvSet('knots_cache_meta', meta);
+    }
+    return meta;
+  },
+
+  async getKnotsCache(): Promise<KnotGuide[]> {
+    try {
+      const db = await openDb();
+      const items = await new Promise<KnotGuide[]>((resolve, reject) => {
+        const tx = db.transaction('knots', 'readonly');
+        const req = tx.objectStore('knots').getAll();
+        req.onsuccess = () => resolve((req.result as KnotGuide[]) ?? []);
+        req.onerror = () => reject(req.error);
+      });
+      if (items.length > 0) return items;
+    } catch {
+      // Fall back to kv store below
+    }
+    return (await kvGet<KnotGuide[]>('knots')) ?? [];
+  },
+
+  async getKnotById(id: string): Promise<KnotGuide | null> {
+    try {
+      const db = await openDb();
+      const item = await new Promise<KnotGuide | null>((resolve, reject) => {
+        const tx = db.transaction('knots', 'readonly');
+        const req = tx.objectStore('knots').get(id);
+        req.onsuccess = () => resolve((req.result as KnotGuide) ?? null);
+        req.onerror = () => reject(req.error);
+      });
+      if (item) return item;
+    } catch {
+      // Fallback below
+    }
+    const all = (await kvGet<KnotGuide[]>('knots')) ?? [];
+    return all.find((k) => k.id === id) ?? null;
+  },
+
+  async getKnotsCacheMeta(): Promise<KnotsCacheMeta | null> {
+    return kvGet<KnotsCacheMeta>('knots_cache_meta');
+  },
+
+  async saveSpeciesAndKnots(species: FishSpecies[], knots: KnotGuide[]): Promise<KnotsCacheMeta> {
     await kvSet('species', species);
-    await kvSet('knots', knots);
+    return this.saveKnotsCache(knots);
   },
   async getSpeciesAndKnots(): Promise<{ species: FishSpecies[]; knots: KnotGuide[] }> {
     const [species, knots] = await Promise.all([
       kvGet<FishSpecies[]>('species'),
-      kvGet<KnotGuide[]>('knots'),
+      this.getKnotsCache(),
     ]);
-    return { species: species ?? [], knots: knots ?? [] };
+    return { species: species ?? [], knots };
   },
 
   async saveLastOpenedWaterBody(bundle: CachedWaterBodyBundle): Promise<void> {

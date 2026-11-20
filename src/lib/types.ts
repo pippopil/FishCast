@@ -60,6 +60,23 @@ export interface WaterBodyAnalysis {
   model_version: string;
 }
 
+export type FishAbundance = 'common' | 'regular' | 'rare';
+
+export interface WaterBodyInhabitingSpecies {
+  species_id: string;
+  abundance: FishAbundance;
+  note?: string;
+}
+
+export interface WaterBodyFishPresence {
+  species_id: string;
+  species_name: string;
+  category: 'predator' | 'peaceful';
+  abundance: FishAbundance;
+  source: 'confirmed_report' | 'catalog' | 'ecological_model';
+  note?: string;
+}
+
 export interface WaterBody {
   id: string;
   name: string | null;
@@ -84,6 +101,7 @@ export interface WaterBody {
   water_clarity: 'clear' | 'moderate' | 'murky';
   contours?: BathymetryContour[];
   target_zone?: LatLng;
+  inhabiting_species?: WaterBodyInhabitingSpecies[];
 }
 
 export interface NearbyWaterBody {

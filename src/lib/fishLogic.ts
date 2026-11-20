@@ -15,6 +15,7 @@ import type {
   WaterBody,
   WaterBodyAccessPoint,
   WaterBodyAnalysis,
+  WaterBodyFishPresence,
   WeatherSnapshot,
 } from './types';
 
@@ -463,7 +464,137 @@ export function computeWaterBodyHabitatModifier(params: {
     reasons.push('паводковая мутность (−)');
   }
 
+  // Ichthyofauna presence check when curated catalog exists for the water body
+  if (wb.inhabiting_species && wb.inhabiting_species.length > 0) {
+    const entry = wb.inhabiting_species.find((item) => item.species_id === sp.id);
+    if (entry) {
+      if (entry.abundance === 'common') modifier += 2;
+    } else {
+      modifier -= 14;
+      reasons.push('редкий или нетипичный вид для водоёма (−)');
+    }
+  }
+
   return { modifier, reasons };
+}
+
+export function getExpectedFishForWaterBody(params: {
+  waterBody: WaterBody;
+  speciesList: FishSpecies[];
+  reports?: CatchReport[];
+}): WaterBodyFishPresence[] {
+  const { waterBody: wb, speciesList, reports = [] } = params;
+  const speciesMap = new Map(speciesList.map((s) => [s.id, s]));
+
+  // Count confirmed catches on this specific water body
+  const confirmedSpeciesIds = new Set<string>();
+  for (const r of reports) {
+    if (r.water_body_id === wb.id && r.outcome !== 'no_bite') {
+      confirmedSpeciesIds.add(r.fish_species_id);
+    }
+  }
+
+  const byId = new Map<string, WaterBodyFishPresence>();
+
+  if (wb.inhabiting_species && wb.inhabiting_species.length > 0) {
+    for (const item of wb.inhabiting_species) {
+      const sp = speciesMap.get(item.species_id);
+      if (!sp) continue;
+      byId.set(sp.id, {
+        species_id: sp.id,
+        species_name: sp.name,
+        category: sp.category,
+        abundance: item.abundance,
+        source: confirmedSpeciesIds.has(sp.id) ? 'confirmed_report' : 'catalog',
+        note: item.note,
+      });
+    }
+  } else {
+    // Ecological fallback for newly discovered OSM or user-submitted water bodies
+    for (const sp of speciesList) {
+      if (!sp.water_types.includes(wb.type)) continue;
+
+      if (wb.ndwi_stability === 'dries_summer' && sp.id !== 'karas' && sp.id !== 'rotan') {
+        continue;
+      }
+
+      const maxD = wb.max_depth_m;
+      if (maxD !== null) {
+        if (maxD < 0.8 && sp.id !== 'karas' && sp.id !== 'rotan') continue;
+        if ((sp.id === 'sudak' || sp.id === 'nalim' || sp.id === 'som') && maxD < 4.0) continue;
+      }
+
+      if (wb.area_ha < 2 && (sp.id === 'sudak' || sp.id === 'som' || sp.id === 'zherekh')) {
+        continue;
+      }
+
+      let abundance: WaterBodyFishPresence['abundance'] = 'regular';
+      if (
+        (wb.type === 'pond' || wb.type === 'oxbow') &&
+        ['karas', 'okun', 'plotva', 'pike', 'rotan'].includes(sp.id)
+      ) {
+        abundance = sp.id === 'karas' || sp.id === 'okun' ? 'common' : 'regular';
+      } else if (
+        wb.type === 'river' &&
+        ['golavl', 'plotva', 'okun', 'pike', 'lesh'].includes(sp.id)
+      ) {
+        abundance = ['golavl', 'plotva', 'okun'].includes(sp.id) ? 'common' : 'regular';
+      } else if (
+        (wb.type === 'reservoir' || wb.type === 'lake') &&
+        ['lesh', 'okun', 'plotva', 'pike', 'sudak'].includes(sp.id)
+      ) {
+        abundance = ['okun', 'plotva', 'pike'].includes(sp.id) || (wb.area_ha >= 500 && ['lesh', 'sudak'].includes(sp.id))
+          ? 'common'
+          : 'regular';
+      } else if (['som', 'nalim', 'karp', 'lin', 'zherekh'].includes(sp.id)) {
+        abundance = 'rare';
+      }
+
+      byId.set(sp.id, {
+        species_id: sp.id,
+        species_name: sp.name,
+        category: sp.category,
+        abundance,
+        source: confirmedSpeciesIds.has(sp.id) ? 'confirmed_report' : 'ecological_model',
+      });
+    }
+  }
+
+  // Ensure any species confirmed by actual catch reports is always included
+  for (const spId of confirmedSpeciesIds) {
+    const existing = byId.get(spId);
+    if (existing) {
+      existing.source = 'confirmed_report';
+    } else {
+      const sp = speciesMap.get(spId);
+      if (sp) {
+        byId.set(sp.id, {
+          species_id: sp.id,
+          species_name: sp.name,
+          category: sp.category,
+          abundance: 'regular',
+          source: 'confirmed_report',
+          note: 'Подтверждено отчётами рыбаков',
+        });
+      }
+    }
+  }
+
+  const abundanceRank: Record<WaterBodyFishPresence['abundance'], number> = {
+    common: 0,
+    regular: 1,
+    rare: 2,
+  };
+
+  return [...byId.values()].sort((a, b) => {
+    const aConf = a.source === 'confirmed_report' ? 0 : 1;
+    const bConf = b.source === 'confirmed_report' ? 0 : 1;
+    if (aConf !== bConf) return aConf - bConf;
+    if (abundanceRank[a.abundance] !== abundanceRank[b.abundance]) {
+      return abundanceRank[a.abundance] - abundanceRank[b.abundance];
+    }
+    return a.species_name.localeCompare(b.species_name, 'ru');
+  });
 }
 
 export function computeReportCalibration(params: {
