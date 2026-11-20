@@ -1,11 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  analyzeBarometricWindow,
   analyzeWaterBody,
+  buildBiteForecastMetadata,
   buildSplitRouteMetrics,
   computeFIndexForecast,
+  computeReportCalibration,
+  computeSunTimes,
+  computeWaterBodyHabitatModifier,
   decodePolyline6,
   detectProspectiveZones,
+  estimateWaterTempC,
   evaluateFIndexAlerts,
   evaluateGoodBiteWaterBodies,
   pointInWaterBody,
@@ -20,7 +26,16 @@ import {
   isPointInBbox,
   normalizeBboxSelection,
 } from './offlineMapRegions';
-import type { BathymetryPoint, CatchReport, FishSpecies, GoodBiteWaterBodyItem, WaterBody, WaterBodyAccessPoint, WeatherSnapshot } from './types';
+import type {
+  BathymetryPoint,
+  CatchReport,
+  FishSpecies,
+  GoodBiteWaterBodyItem,
+  HourlyWeatherPoint,
+  WaterBody,
+  WaterBodyAccessPoint,
+  WeatherSnapshot,
+} from './types';
 
 const sampleSpecies: FishSpecies = {
   id: 'pike',
@@ -621,4 +636,344 @@ test('all seed water bodies, contours, bathymetry points, reports, and access po
     );
   }
 });
+
+test('computeSunTimes returns seasonal sunrise and sunset for Moscow/Istra latitude', () => {
+  const nov = computeSunTimes(56.02, 36.83, new Date('2026-11-15T12:00:00Z'));
+  const jun = computeSunTimes(56.02, 36.83, new Date('2026-06-21T12:00:00Z'));
+
+  assert.ok(nov.sunriseHour >= 7.0 && nov.sunriseHour <= 9.0, `Expected Nov sunrise ~8h, got ${nov.sunriseHour}`);
+  assert.ok(nov.sunsetHour >= 15.0 && nov.sunsetHour <= 17.5, `Expected Nov sunset ~16:20, got ${nov.sunsetHour}`);
+  assert.ok(jun.sunriseHour >= 2.5 && jun.sunriseHour <= 5.0, `Expected Jun sunrise ~3:45, got ${jun.sunriseHour}`);
+  assert.ok(jun.sunsetHour >= 20.0 && jun.sunsetHour <= 22.5, `Expected Jun sunset ~21:15, got ${jun.sunsetHour}`);
+  assert.ok(jun.sunsetHour - jun.sunriseHour > nov.sunsetHour - nov.sunriseHour + 6);
+  assert.match(nov.sunriseStr, /^\d{2}:\d{2}$/);
+  assert.match(jun.sunsetStr, /^\d{2}:\d{2}$/);
+});
+
+test('estimateWaterTempC models deep thermal inertia and triggers under-ice regime on prolonged freeze', () => {
+  const coldSnapWeather: WeatherSnapshot = {
+    ...sampleWeather,
+    air_temp_c: -2,
+    avg_air_temp_7d_c: 6,
+    avg_air_temp_14d_c: 11,
+  };
+  const deepRes: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-deep',
+    type: 'reservoir',
+    avg_depth_m: 6.5,
+    max_depth_m: 18,
+    connected_to: null,
+  };
+  const shallowPond: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-shallow',
+    type: 'pond',
+    avg_depth_m: 1.4,
+    max_depth_m: 2.0,
+    connected_to: null,
+  };
+
+  const deepEst = estimateWaterTempC(coldSnapWeather, deepRes);
+  const shallowEst = estimateWaterTempC(coldSnapWeather, shallowPond);
+  assert.equal(deepEst.isIceRegime, false);
+  assert.equal(shallowEst.isIceRegime, false);
+  assert.ok(
+    deepEst.waterTempC > shallowEst.waterTempC + 1.5,
+    `Deep reservoir (${deepEst.waterTempC}C) should hold heat better than shallow pond (${shallowEst.waterTempC}C)`
+  );
+
+  const deepFreezeWeather: WeatherSnapshot = {
+    ...sampleWeather,
+    air_temp_c: -11,
+    avg_air_temp_7d_c: -7.5,
+    avg_air_temp_14d_c: -6.0,
+  };
+  const iceDeep = estimateWaterTempC(deepFreezeWeather, deepRes);
+  const iceShallow = estimateWaterTempC(deepFreezeWeather, shallowPond);
+  assert.equal(iceDeep.isIceRegime, true);
+  assert.equal(iceShallow.isIceRegime, true);
+  assert.ok(iceDeep.waterTempC >= 1.2 && iceDeep.waterTempC <= 2.6);
+  assert.ok(iceShallow.waterTempC >= 1.2 && iceShallow.waterTempC <= 2.6);
+});
+
+test('analyzeBarometricWindow and computeFIndexForecast penalize sharp 6h pressure crash vs 48h stability', () => {
+  const buildHourly = (mode: 'stable' | 'crash' | 'prefontal'): HourlyWeatherPoint[] => {
+    const startMs = Date.parse('2026-11-11T00:00:00Z');
+    const out: HourlyWeatherPoint[] = [];
+    for (let h = 0; h < 120; h++) {
+      const tMs = startMs + h * 3600000;
+      let pressure = 1016;
+      if (mode === 'crash' && h >= 54 && h <= 72) {
+        // Drop 1.2 hPa per hour -> delta6h ~ -7.2 hPa around Nov 13 09:00..15:00
+        pressure = 1016 - (h - 54) * 1.2;
+      } else if (mode === 'prefontal' && h >= 54 && h <= 72) {
+        // Gentle pre-frontal drop ~ -0.3 hPa/h -> delta6h = -1.8 hPa
+        pressure = 1016 - (h - 54) * 0.3;
+      }
+      out.push({
+        time: new Date(tMs).toISOString().slice(0, 16) + ':00Z',
+        temp_c: 5,
+        pressure_hpa: Number(pressure.toFixed(1)),
+        wind_speed_ms: 3.5,
+        wind_direction_deg: 240,
+        cloud_cover_pct: 75,
+        precipitation_mm: 0,
+      });
+    }
+    return out;
+  };
+
+  const baseDate = new Date('2026-11-13T09:00:00Z');
+  const targetMs = Date.parse('2026-11-13T12:00:00Z');
+
+  const stableHourly = buildHourly('stable');
+  const crashHourly = buildHourly('crash');
+  const prefrontalHourly = buildHourly('prefontal');
+
+  const stableBaro = analyzeBarometricWindow(stableHourly, targetMs, sampleWeather);
+  const crashBaro = analyzeBarometricWindow(crashHourly, targetMs, sampleWeather);
+  const prefrontalBaro = analyzeBarometricWindow(prefrontalHourly, targetMs, sampleWeather);
+
+  assert.ok(stableBaro.stability48h >= 0.9);
+  assert.ok(crashBaro.delta6h <= -5.0, `Expected crash delta6h <= -5, got ${crashBaro.delta6h}`);
+  assert.ok(prefrontalBaro.delta6h <= -1.2 && prefrontalBaro.delta6h >= -2.5);
+
+  const stableSlots = computeFIndexForecast({
+    species: sampleSpecies,
+    weather: { ...sampleWeather, hourly: stableHourly, avg_air_temp_7d_c: 6, avg_air_temp_14d_c: 7 },
+    baseDate,
+  });
+  const crashSlots = computeFIndexForecast({
+    species: sampleSpecies,
+    weather: { ...sampleWeather, hourly: crashHourly, avg_air_temp_7d_c: 6, avg_air_temp_14d_c: 7 },
+    baseDate,
+  });
+  const prefrontalSlots = computeFIndexForecast({
+    species: sampleSpecies,
+    weather: { ...sampleWeather, hourly: prefrontalHourly, avg_air_temp_7d_c: 6, avg_air_temp_14d_c: 7 },
+    baseDate,
+  });
+
+  const stableMidday = stableSlots.find((s) => s.day_label === 'Сегодня' && s.hour_interval === '15:00')!;
+  const crashMidday = crashSlots.find((s) => s.day_label === 'Сегодня' && s.hour_interval === '15:00')!;
+  const prefrontalMidday = prefrontalSlots.find((s) => s.day_label === 'Сегодня' && s.hour_interval === '15:00')!;
+
+  assert.ok(
+    stableMidday.f_index > crashMidday.f_index + 15,
+    `Stable (${stableMidday.f_index}) should strongly beat pressure crash (${crashMidday.f_index})`
+  );
+  assert.ok(
+    prefrontalMidday.f_index > crashMidday.f_index + 15,
+    `Pre-frontal gentle drop (${prefrontalMidday.f_index}) should favor predator over crash (${crashMidday.f_index})`
+  );
+  assert.ok(crashMidday.factors.some((f) => f.includes('Резкий скачок давления')));
+});
+
+test('computeWaterBodyHabitatModifier penalizes river flood turbidity after heavy 72h rain', () => {
+  const riverWb: WaterBody = {
+    ...sampleWaterBody,
+    id: 'wb-river-test',
+    type: 'river',
+    connected_to: 'wb-main',
+  };
+  const dryMod = computeWaterBodyHabitatModifier({
+    waterBody: riverWb,
+    species: sampleSpecies,
+    weather: { ...sampleWeather, recent_rain_72h_mm: 2 },
+  });
+  const floodMod = computeWaterBodyHabitatModifier({
+    waterBody: riverWb,
+    species: sampleSpecies,
+    weather: { ...sampleWeather, recent_rain_72h_mm: 40 },
+  });
+
+  assert.ok(floodMod.modifier <= dryMod.modifier - 7);
+  assert.ok(floodMod.reasons.some((r) => r.includes('паводковая мутность')));
+});
+
+test('computeReportCalibration applies Bayesian shrinkage, weights weather similarity, and handles no_bite reports', () => {
+  const baseDate = new Date('2026-11-13T12:00:00Z');
+  const makeReport = (
+    id: string,
+    outcome: 'catch' | 'no_bite',
+    pressureHpa: number,
+    waterTempC: number
+  ): CatchReport => ({
+    id,
+    client_event_id: id,
+    user_id: 'u-1',
+    author_nickname: 'Тест',
+    author_verified: true,
+    water_body_id: sampleWaterBody.id,
+    water_body_name: sampleWaterBody.display_label,
+    lat: sampleWaterBody.center.lat,
+    lng: sampleWaterBody.center.lng,
+    created_at: '2026-11-13T08:00:00Z',
+    updated_at: '2026-11-13T08:00:00Z',
+    fish_species_id: sampleSpecies.id,
+    fish_species_name: sampleSpecies.name,
+    weight_kg: outcome === 'catch' ? 1.8 : null,
+    length_cm: outcome === 'catch' ? 54 : null,
+    bait: 'Джиг',
+    retrieve: 'Ступенька',
+    weather_summary: '762 мм',
+    photo_url: null,
+    notes: '',
+    visibility: 'public',
+    source: 'diary',
+    outcome,
+    weather_snapshot: {
+      pressure_hpa: pressureHpa,
+      pressure_trend: 'steady',
+      air_temp_c: 5,
+      water_temp_c: waterTempC,
+      wind_speed_ms: 3.5,
+      wind_direction_label: 'ЮЗ',
+      cloud_cover_pct: 60,
+      precipitation_mm: 0,
+    },
+  });
+
+  // Single catch report should be shrunk modestly (not an extreme +12 swing)
+  const singleCatch = computeReportCalibration({
+    waterBody: sampleWaterBody,
+    species: sampleSpecies,
+    weather: sampleWeather,
+    reports: [makeReport('r1', 'catch', 1016, 7.5)],
+    baseDate,
+  });
+  assert.ok(singleCatch.delta > 0 && singleCatch.delta <= 6, `Single report delta should be shrunk, got ${singleCatch.delta}`);
+  assert.equal(singleCatch.catchCount, 1);
+
+  // Weather-similar reports should yield stronger delta than weather-mismatched reports
+  const similarMulti = computeReportCalibration({
+    waterBody: sampleWaterBody,
+    species: sampleSpecies,
+    weather: sampleWeather,
+    reports: [
+      makeReport('s1', 'catch', 1016, 7.5),
+      makeReport('s2', 'catch', 1017, 7.6),
+      makeReport('s3', 'catch', 1015, 7.4),
+    ],
+    baseDate,
+  });
+  const mismatchedMulti = computeReportCalibration({
+    waterBody: sampleWaterBody,
+    species: sampleSpecies,
+    weather: sampleWeather,
+    reports: [
+      makeReport('m1', 'catch', 990, 22),
+      makeReport('m2', 'catch', 988, 23),
+      makeReport('m3', 'catch', 992, 21),
+    ],
+    baseDate,
+  });
+  assert.ok(
+    similarMulti.delta > mismatchedMulti.delta,
+    `Weather-similar (${similarMulti.delta}) should outweigh weather-mismatched (${mismatchedMulti.delta})`
+  );
+
+  // Multiple no_bite reports should yield negative calibration delta
+  const noBiteCal = computeReportCalibration({
+    waterBody: sampleWaterBody,
+    species: sampleSpecies,
+    weather: sampleWeather,
+    reports: [
+      makeReport('nb1', 'no_bite', 1016, 7.5),
+      makeReport('nb2', 'no_bite', 1016, 7.4),
+      makeReport('nb3', 'no_bite', 1015, 7.6),
+    ],
+    baseDate,
+  });
+  assert.ok(noBiteCal.delta <= -4, `Expected negative delta for no_bite cluster, got ${noBiteCal.delta}`);
+  assert.equal(noBiteCal.noBiteCount, 3);
+  assert.ok(noBiteCal.summaryReason?.includes('без клёва'));
+});
+
+test('buildBiteForecastMetadata distinguishes high-confidence live hourly+reports from low-confidence offline fallback', () => {
+  const baseDate = new Date('2026-11-13T09:00:00Z');
+  const hourly24: HourlyWeatherPoint[] = Array.from({ length: 48 }, (_, i) => ({
+    time: new Date(Date.parse('2026-11-12T00:00:00Z') + i * 3600000).toISOString().slice(0, 16) + ':00Z',
+    temp_c: 5,
+    pressure_hpa: 1016,
+    wind_speed_ms: 3.5,
+    wind_direction_deg: 240,
+    cloud_cover_pct: 60,
+    precipitation_mm: 0,
+  }));
+
+  const highMeta = buildBiteForecastMetadata({
+    weather: { ...sampleWeather, source: 'open-meteo', hourly: hourly24, avg_air_temp_7d_c: 6, avg_air_temp_14d_c: 7 },
+    species: sampleSpecies,
+    waterBody: sampleWaterBody,
+    baseDate,
+  });
+  assert.equal(highMeta.confidence_level, 'high');
+  assert.ok((highMeta.confidence_score ?? 0) >= 75);
+  assert.equal(highMeta.regime, 'open_water');
+
+  const lowMeta = buildBiteForecastMetadata({
+    weather: { ...sampleWeather, source: 'offline-fallback', hourly: undefined },
+    species: sampleSpecies,
+    waterBody: null,
+    baseDate,
+  });
+  assert.equal(lowMeta.confidence_level, 'low');
+  assert.ok((lowMeta.confidence_score ?? 100) < 52);
+});
+
+test('recommendLures boosts ice-fishing lures (балансир/мормышка) over воблер in ice regime', () => {
+  const winterSpecies: FishSpecies = {
+    ...sampleSpecies,
+    lures: [
+      {
+        id: 'wobbler-minnow',
+        lure_type: 'Воблер-минноу 90 мм',
+        category: 'воблер',
+        depth_min_m: 1.0,
+        depth_max_m: 3.5,
+        best_seasons: [1, 2, 12],
+        best_clarity: ['clear', 'moderate'],
+        water_types: ['pond', 'lake', 'reservoir'],
+        retrieve: 'Твичинг',
+        rationale: 'Открытая вода',
+        source: 'editorial',
+        base_rank: 9,
+      },
+      {
+        id: 'ice-balancer',
+        lure_type: 'Балансир 5 см',
+        category: 'балансир',
+        depth_min_m: 1.0,
+        depth_max_m: 6.0,
+        best_seasons: [1, 2, 12],
+        best_clarity: ['clear', 'moderate'],
+        water_types: ['pond', 'lake', 'reservoir'],
+        retrieve: 'Взмах — пауза 4 сек',
+        rationale: 'Подлёдная ловля',
+        source: 'editorial',
+        base_rank: 8,
+      },
+    ],
+  };
+
+  const openWaterRecs = recommendLures({
+    species: winterSpecies,
+    waterBody: sampleWaterBody,
+    month: 1,
+    isIceRegime: false,
+  });
+  const iceRecs = recommendLures({
+    species: winterSpecies,
+    waterBody: sampleWaterBody,
+    month: 1,
+    isIceRegime: true,
+  });
+
+  assert.equal(openWaterRecs[0].lure.id, 'wobbler-minnow');
+  assert.equal(iceRecs[0].lure.id, 'ice-balancer');
+  assert.ok(iceRecs[0].reasons.some((r) => r.includes('подлёдной')));
+});
+
 

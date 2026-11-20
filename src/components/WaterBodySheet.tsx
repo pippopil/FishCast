@@ -115,6 +115,7 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
 }) => {
   const [subTab, setSubTab] = useState<DetailSubTab>('forecast');
   const [selectedDay, setSelectedDay] = useState<'Сегодня' | 'Завтра' | 'Послезавтра'>('Сегодня');
+  const [selectedHourInterval, setSelectedHourInterval] = useState<string | null>(null);
   const [profileLineMode, setProfileLineMode] = useState<BathymetryProfileLineMode>('transect');
   const [depthVal, setDepthVal] = useState('4.5');
   const [depthSource, setDepthSource] = useState<'manual' | 'sonar'>('manual');
@@ -140,6 +141,8 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
     (best, cur) => (cur.f_index > best.f_index ? cur : best),
     daySlots[0] ?? { f_index: 0, probability_label: 'средняя вероятность' as const, hour_interval: '06:00', factors: [] }
   );
+  const activeSlot =
+    daySlots.find((s) => s.hour_interval === selectedHourInterval) ?? peakSlot;
 
   const handleDepthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -288,7 +291,7 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
             {/* Weather Strip */}
             {weather && (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3.5 dark:border-slate-800 dark:bg-slate-800/60">
-                <div className="flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300">
+                <div className="flex items-center justify-between gap-2 text-xs font-semibold text-slate-700 dark:text-slate-300">
                   <span>Среда и погода (Open-Meteo)</span>
                   <span className="font-mono text-[11px] text-slate-500">
                     {weather.moon_phase} ({weather.moon_illumination}%)
@@ -300,12 +303,14 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                     <div className="mt-0.5 font-mono text-xs sm:text-sm font-bold text-slate-900 dark:text-white tabular-nums whitespace-nowrap">
                       {weather.pressure_mmhg} мм
                     </div>
-                    <div className="text-[11px] text-slate-500 whitespace-nowrap">
-                      {weather.pressure_trend === 'steady'
-                        ? 'стабильно'
-                        : weather.pressure_trend === 'rising'
-                          ? 'растёт'
-                          : 'падает'}
+                    <div className="text-[11px] text-slate-500 whitespace-nowrap tabular-nums">
+                      {typeof weather.pressure_delta_6h === 'number'
+                        ? `Δ6ч ${weather.pressure_delta_6h > 0 ? '+' : ''}${weather.pressure_delta_6h} гПа`
+                        : weather.pressure_trend === 'steady'
+                          ? 'стабильно'
+                          : weather.pressure_trend === 'rising'
+                            ? 'растёт'
+                            : 'падает'}
                     </div>
                   </div>
                   <div className="rounded-xl bg-white p-2.5 dark:bg-slate-900">
@@ -314,10 +319,12 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                       <span>Т° вода/возд</span>
                     </div>
                     <div className="mt-0.5 font-mono text-xs sm:text-sm font-bold text-slate-900 dark:text-white tabular-nums whitespace-nowrap">
-                      {weather.water_temp_c}° / {weather.air_temp_c}°
+                      {forecast?.estimated_water_temp_c ?? weather.water_temp_c}° / {weather.air_temp_c}°
                     </div>
                     <div className="text-[11px] text-slate-500 whitespace-nowrap">
-                      Осадки {weather.precipitation_mm} мм
+                      {typeof weather.cloud_cover_pct === 'number'
+                        ? `Облачн. ${weather.cloud_cover_pct}%`
+                        : `Осадки ${weather.precipitation_mm} мм`}
                     </div>
                   </div>
                   <div className="rounded-xl bg-white p-2.5 dark:bg-slate-900">
@@ -328,9 +335,24 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                     <div className="mt-0.5 font-mono text-xs sm:text-sm font-bold text-slate-900 dark:text-white tabular-nums whitespace-nowrap">
                       {weather.wind_speed_ms} м/с
                     </div>
-                    <div className="text-[11px] text-slate-500 whitespace-nowrap">{weather.wind_direction_label}</div>
+                    <div className="text-[11px] text-slate-500 whitespace-nowrap">
+                      {weather.wind_direction_label}
+                      {weather.precipitation_mm > 0 ? ` · ${weather.precipitation_mm} мм` : ''}
+                    </div>
                   </div>
                 </div>
+                {(forecast?.sunrise || forecast?.regime) && (
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600 dark:text-slate-400">
+                    {forecast?.sunrise && forecast?.sunset && (
+                      <span className="font-mono tabular-nums">
+                        Восход {forecast.sunrise} · Закат {forecast.sunset}
+                      </span>
+                    )}
+                    <span className="font-semibold text-slate-700 dark:text-slate-300">
+                      {forecast?.regime === 'ice' ? 'Ледовый режим' : 'Открытая вода'}
+                    </span>
+                  </div>
+                )}
               </div>
             )}
 
@@ -360,7 +382,10 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                   <button
                     key={day}
                     type="button"
-                    onClick={() => setSelectedDay(day)}
+                    onClick={() => {
+                      setSelectedDay(day);
+                      setSelectedHourInterval(null);
+                    }}
                     className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
                       selectedDay === day
                         ? 'bg-sky-700 text-white'
@@ -383,34 +408,90 @@ export const WaterBodySheet: React.FC<WaterBodySheetProps> = ({
                   </span>
                 </div>
 
+                {/* Model confidence & Bayesian calibration bar */}
+                {forecast?.confidence_label && (
+                  <div
+                    data-testid="forecast-confidence-bar"
+                    className="mt-2 flex flex-wrap items-center justify-between gap-1.5 rounded-lg bg-slate-50 px-2.5 py-1.5 text-[11px] dark:bg-slate-800/70"
+                  >
+                    <span
+                      className={`font-semibold ${
+                        forecast.confidence_level === 'high'
+                          ? 'text-teal-700 dark:text-teal-400'
+                          : forecast.confidence_level === 'medium'
+                            ? 'text-sky-700 dark:text-sky-400'
+                            : 'text-amber-700 dark:text-amber-400'
+                      }`}
+                    >
+                      {forecast.confidence_label}
+                    </span>
+                    {typeof forecast.calibration_delta === 'number' && forecast.calibration_delta !== 0 && (
+                      <span className="font-mono font-bold text-slate-700 dark:text-slate-200 tabular-nums">
+                        поправка {forecast.calibration_delta > 0 ? `+${forecast.calibration_delta}` : forecast.calibration_delta}
+                      </span>
+                    )}
+                  </div>
+                )}
+
                 {forecastLoading ? (
                   <div className="mt-4 text-xs text-slate-500">Обновляем прогноз...</div>
                 ) : (
-                  <div className="mt-3 grid grid-cols-8 gap-1.5 items-end h-24">
-                    {daySlots.map((slot) => {
-                      const barColor =
-                        slot.f_index >= 66
-                          ? 'bg-teal-600'
-                          : slot.f_index >= 40
-                            ? 'bg-sky-600'
-                            : 'bg-slate-400';
-                      return (
-                        <div key={slot.hour_interval} className="flex flex-col items-center gap-1 h-full justify-end">
-                          <span className="font-mono text-[10px] font-semibold text-slate-700 dark:text-slate-300 tabular-nums">
-                            {slot.f_index}
-                          </span>
-                          <div
-                            className={`w-full rounded-t-md transition-all ${barColor}`}
-                            style={{ height: `${Math.max(12, Math.round(slot.f_index * 0.62))}px` }}
+                  <>
+                    <div className="mt-3 grid grid-cols-8 gap-1.5 items-end h-24">
+                      {daySlots.map((slot) => {
+                        const isSelected = activeSlot.hour_interval === slot.hour_interval;
+                        const barColor =
+                          slot.f_index >= 66
+                            ? 'bg-teal-600'
+                            : slot.f_index >= 40
+                              ? 'bg-sky-600'
+                              : 'bg-slate-400';
+                        return (
+                          <button
+                            key={slot.hour_interval}
+                            type="button"
+                            onClick={() => setSelectedHourInterval(slot.hour_interval)}
+                            className={`flex flex-col items-center gap-1 h-full justify-end rounded-md px-0.5 transition-all ${
+                              isSelected ? 'ring-2 ring-sky-500/70 bg-sky-50/70 dark:bg-sky-950/30' : ''
+                            }`}
                             title={`${slot.hour_interval}: F-${slot.f_index} (${slot.probability_label})`}
-                          />
-                          <span className="font-mono text-[10px] text-slate-500 tabular-nums">
-                            {slot.hour_interval.slice(0, 2)}
+                          >
+                            <span className="font-mono text-[10px] font-semibold text-slate-700 dark:text-slate-300 tabular-nums">
+                              {slot.f_index}
+                            </span>
+                            <div
+                              className={`w-full rounded-t-md transition-all ${barColor}`}
+                              style={{ height: `${Math.max(12, Math.round(slot.f_index * 0.62))}px` }}
+                            />
+                            <span className="font-mono text-[10px] text-slate-500 tabular-nums">
+                              {slot.hour_interval.slice(0, 2)}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Selected slot factor & hourly meteo breakdown */}
+                    {activeSlot && (
+                      <div className="mt-3 border-t border-slate-100 pt-2.5 text-[11px] dark:border-slate-800">
+                        <div className="flex flex-wrap items-center justify-between gap-1 text-slate-700 dark:text-slate-300">
+                          <span className="font-semibold">
+                            Слот {activeSlot.hour_interval}: F-{activeSlot.f_index}
                           </span>
+                          {typeof activeSlot.temp_c === 'number' && (
+                            <span className="font-mono text-slate-500 tabular-nums">
+                              {activeSlot.temp_c}°C · {activeSlot.wind_speed_ms} м/с · {activeSlot.pressure_mmhg} мм · об. {activeSlot.cloud_cover_pct ?? 0}%
+                            </span>
+                          )}
                         </div>
-                      );
-                    })}
-                  </div>
+                        {activeSlot.factors.length > 0 && (
+                          <p className="mt-1 text-slate-600 dark:text-slate-400 leading-relaxed">
+                            Факторы: {activeSlot.factors.join(' · ')}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </>
                 )}
 
                 <p className="mt-2.5 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">

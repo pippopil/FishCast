@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { LocateFixed, Radio, X } from 'lucide-react';
-import type { FishSpecies, LatLng, ReportVisibility, WaterBody } from '../lib/types';
+import type { FishSpecies, LatLng, ReportOutcome, ReportVisibility, WaterBody } from '../lib/types';
 
 interface QuickMarkModalProps {
   isOpen: boolean;
@@ -14,6 +14,7 @@ interface QuickMarkModalProps {
     lng: number | null;
     fish_species_id: string;
     water_body_id: string | null;
+    outcome: ReportOutcome;
     bait: string;
     notes: string;
     visibility: ReportVisibility;
@@ -32,6 +33,7 @@ export const QuickMarkModal: React.FC<QuickMarkModalProps> = ({
   currentCoords,
   onSubmit,
 }) => {
+  const [outcome, setOutcome] = useState<ReportOutcome>('catch');
   const [speciesId, setSpeciesId] = useState(speciesList[0]?.id ?? 'pike');
   const [waterBodyId, setWaterBodyId] = useState(selectedWaterBody?.id ?? '');
   const [latInput, setLatInput] = useState(
@@ -108,12 +110,13 @@ export const QuickMarkModal: React.FC<QuickMarkModalProps> = ({
       lng: parsedLng !== null && !Number.isNaN(parsedLng) ? parsedLng : null,
       fish_species_id: speciesId,
       water_body_id: waterBodyId || null,
+      outcome,
       bait,
       notes,
       visibility,
-      photo_url: photoData?.url ?? null,
-      photo_size_bytes: photoData?.size,
-      photo_mime: photoData?.mime,
+      photo_url: outcome === 'no_bite' ? null : photoData?.url ?? null,
+      photo_size_bytes: outcome === 'no_bite' ? undefined : photoData?.size,
+      photo_mime: outcome === 'no_bite' ? undefined : photoData?.mime,
     });
     setSubmitting(false);
 
@@ -135,10 +138,12 @@ export const QuickMarkModal: React.FC<QuickMarkModalProps> = ({
         <div className="flex items-start justify-between gap-4">
           <div>
             <h2 id="quick-mark-title" className="text-lg font-bold text-slate-900 dark:text-slate-100">
-              Метка «Клюёт здесь сейчас»
+              {outcome === 'no_bite' ? 'Отметка «Клёва не было»' : 'Метка «Клюёт здесь сейчас»'}
             </h2>
             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-              Отметка появится у других рыбаков на карте в реальном времени.
+              {outcome === 'no_bite'
+                ? 'Помогает модели точнее калибровать вероятность клёва по реальным условиям.'
+                : 'Отметка появится у других рыбаков на карте и откалибрует прогноз.'}
             </p>
           </div>
           <button
@@ -152,6 +157,32 @@ export const QuickMarkModal: React.FC<QuickMarkModalProps> = ({
         </div>
 
         <form onSubmit={(e) => void handleSubmit(e)} className="mt-4 space-y-4">
+          {/* Outcome segmented toggle */}
+          <div className="grid grid-cols-2 gap-1.5 rounded-xl bg-slate-100 p-1 dark:bg-slate-800" role="group" aria-label="Результат рыбалки">
+            <button
+              type="button"
+              onClick={() => setOutcome('catch')}
+              className={`min-h-[38px] rounded-lg px-2 py-1.5 text-xs font-semibold transition-colors ${
+                outcome === 'catch'
+                  ? 'bg-white text-teal-700 shadow-sm dark:bg-slate-700 dark:text-teal-300'
+                  : 'text-slate-600 hover:text-slate-900 dark:text-slate-400'
+              }`}
+            >
+              Есть клёв / улов
+            </button>
+            <button
+              type="button"
+              onClick={() => setOutcome('no_bite')}
+              className={`min-h-[38px] rounded-lg px-2 py-1.5 text-xs font-semibold transition-colors ${
+                outcome === 'no_bite'
+                  ? 'bg-white text-amber-700 shadow-sm dark:bg-slate-700 dark:text-amber-300'
+                  : 'text-slate-600 hover:text-slate-900 dark:text-slate-400'
+              }`}
+            >
+              Был — клёва нет
+            </button>
+          </div>
+
           {error && (
             <div
               role="alert"
@@ -323,10 +354,18 @@ export const QuickMarkModal: React.FC<QuickMarkModalProps> = ({
             <button
               type="submit"
               disabled={submitting}
-              className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-sky-700 px-5 py-2 text-sm font-semibold text-white hover:bg-sky-800 disabled:opacity-60"
+              className={`inline-flex min-h-[44px] items-center gap-2 rounded-xl px-5 py-2 text-sm font-semibold text-white disabled:opacity-60 ${
+                outcome === 'no_bite'
+                  ? 'bg-slate-800 hover:bg-slate-900 dark:bg-amber-700 dark:hover:bg-amber-800'
+                  : 'bg-sky-700 hover:bg-sky-800'
+              }`}
             >
               <Radio className="h-4 w-4" aria-hidden="true" />
-              {submitting ? 'Отправка...' : 'Отправить отметку'}
+              {submitting
+                ? 'Отправка...'
+                : outcome === 'no_bite'
+                  ? 'Отметить «клёва нет»'
+                  : 'Отправить отметку'}
             </button>
           </div>
         </form>

@@ -578,9 +578,20 @@ async function startServer() {
     const lat = Number(req.query.lat ?? 55.975);
     const lng = Number(req.query.lng ?? 36.825);
     const fishId = String(req.query.fish_id || 'pike');
+    const waterBodyId = req.query.water_body_id ? String(req.query.water_body_id) : null;
     const dateStr = req.query.date ? String(req.query.date) : undefined;
     const species = store.species.find((s) => s.id === fishId) ?? store.species[0];
-    const forecast = await fetchBiteForecastViaProxy({ lat, lng, species, dateStr });
+    const waterBody = waterBodyId
+      ? store.db.waterBodies.find((w) => w.id === waterBodyId) ?? null
+      : null;
+    const forecast = await fetchBiteForecastViaProxy({
+      lat,
+      lng,
+      species,
+      dateStr,
+      waterBody,
+      reports: store.db.catchReports,
+    });
     return res.json(forecast);
   });
 
@@ -687,6 +698,33 @@ async function startServer() {
     }
 
     const nowIso = new Date().toISOString();
+    const outcome = req.body.outcome === 'no_bite' ? 'no_bite' : 'catch';
+    const rawWs = req.body.weather_snapshot;
+    const weatherSnapshot =
+      rawWs &&
+      typeof rawWs === 'object' &&
+      typeof rawWs.pressure_hpa === 'number' &&
+      typeof rawWs.water_temp_c === 'number'
+        ? {
+            pressure_hpa: Number(rawWs.pressure_hpa),
+            pressure_trend:
+              rawWs.pressure_trend === 'rising' || rawWs.pressure_trend === 'falling'
+                ? rawWs.pressure_trend
+                : ('steady' as const),
+            pressure_delta_6h:
+              typeof rawWs.pressure_delta_6h === 'number' ? Number(rawWs.pressure_delta_6h) : undefined,
+            water_temp_c: Number(rawWs.water_temp_c),
+            air_temp_c: typeof rawWs.air_temp_c === 'number' ? Number(rawWs.air_temp_c) : Number(rawWs.water_temp_c),
+            wind_speed_ms: typeof rawWs.wind_speed_ms === 'number' ? Number(rawWs.wind_speed_ms) : 3.0,
+            wind_direction_label:
+              typeof rawWs.wind_direction_label === 'string' ? rawWs.wind_direction_label : 'ЮЗ',
+            cloud_cover_pct:
+              typeof rawWs.cloud_cover_pct === 'number' ? Number(rawWs.cloud_cover_pct) : undefined,
+            precipitation_mm: typeof rawWs.precipitation_mm === 'number' ? Number(rawWs.precipitation_mm) : 0,
+            hour_local: typeof rawWs.hour_local === 'number' ? Number(rawWs.hour_local) : new Date().getHours(),
+          }
+        : undefined;
+
     const report: CatchReport = {
       id: `rep-${crypto.randomUUID().slice(0, 8)}`,
       client_event_id: clientEventId,
@@ -701,11 +739,13 @@ async function startServer() {
       updated_at: nowIso,
       fish_species_id: species.id,
       fish_species_name: species.name,
-      weight_kg: typeof req.body.weight_kg === 'number' ? req.body.weight_kg : null,
-      length_cm: typeof req.body.length_cm === 'number' ? req.body.length_cm : null,
+      outcome,
+      weight_kg: outcome === 'no_bite' ? null : typeof req.body.weight_kg === 'number' ? req.body.weight_kg : null,
+      length_cm: outcome === 'no_bite' ? null : typeof req.body.length_cm === 'number' ? req.body.length_cm : null,
       bait: typeof req.body.bait === 'string' ? req.body.bait.trim() : '',
       retrieve: typeof req.body.retrieve === 'string' ? req.body.retrieve.trim() : '',
       weather_summary: typeof req.body.weather_summary === 'string' ? req.body.weather_summary : '',
+      weather_snapshot: weatherSnapshot,
       photo_url: safePhotoUrl,
       notes: typeof req.body.notes === 'string' ? req.body.notes.trim() : '',
       visibility: req.body.visibility ?? user?.privacy_default ?? 'public',
@@ -717,6 +757,7 @@ async function startServer() {
     if (store.db.seenClientEventIds.length > 2000) {
       store.db.seenClientEventIds = store.db.seenClientEventIds.slice(-1000);
     }
+    store.forecastCache.clear();
     store.persist();
 
     if (report.visibility !== 'private') {
@@ -732,6 +773,7 @@ async function startServer() {
     const existing = store.db.catchReports[idx];
     const updated: CatchReport = {
       ...existing,
+      outcome: req.body.outcome === 'no_bite' ? 'no_bite' : req.body.outcome === 'catch' ? 'catch' : existing.outcome,
       weight_kg: req.body.weight_kg !== undefined ? req.body.weight_kg : existing.weight_kg,
       length_cm: req.body.length_cm !== undefined ? req.body.length_cm : existing.length_cm,
       bait: typeof req.body.bait === 'string' ? req.body.bait : existing.bait,
@@ -740,6 +782,7 @@ async function startServer() {
       updated_at: new Date().toISOString(),
     };
     store.db.catchReports[idx] = updated;
+    store.forecastCache.clear();
     store.persist();
     return res.json({ report: updated });
   });
@@ -748,6 +791,7 @@ async function startServer() {
     const idx = store.db.catchReports.findIndex((r) => r.id === req.params.id);
     if (idx === -1) return res.status(404).json({ error: 'Запись не найдена.' });
     store.db.catchReports.splice(idx, 1);
+    store.forecastCache.clear();
     store.persist();
     return res.json({ ok: true });
   });

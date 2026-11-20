@@ -2,10 +2,12 @@ import type {
   BathymetryPoint,
   BiteAlertEvent,
   BiteAlertSettings,
+  BiteForecastResponse,
   BiteForecastSlot,
   CatchReport,
   FishSpecies,
   GoodBiteWaterBodyItem,
+  HourlyWeatherPoint,
   LatLng,
   LureRecommendationResult,
   ProspectiveZone,
@@ -152,63 +154,618 @@ export function probabilityLabelFromScore(score: number): BiteForecastSlot['prob
   return 'низкая вероятность';
 }
 
+function formatHourMinute(hourFloat: number): string {
+  const normalized = ((hourFloat % 24) + 24) % 24;
+  const h = Math.floor(normalized);
+  const m = Math.round((normalized - h) * 60);
+  const hh = (m === 60 ? (h + 1) % 24 : h).toString().padStart(2, '0');
+  const mm = (m === 60 ? 0 : m).toString().padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+export function computeSunTimes(
+  lat: number,
+  lng: number,
+  date: Date
+): { sunriseHour: number; sunsetHour: number; sunriseStr: string; sunsetStr: string } {
+  const startOfYear = Date.UTC(date.getUTCFullYear(), 0, 1);
+  const dayOfYear = Math.max(
+    1,
+    Math.min(366, Math.floor((date.getTime() - startOfYear) / 86400000) + 1)
+  );
+  const rad = Math.PI / 180;
+  const B = ((2 * Math.PI) / 365) * (dayOfYear - 81);
+  const eqTimeMin = 9.87 * Math.sin(2 * B) - 7.53 * Math.cos(B) - 1.5 * Math.sin(B);
+  const declRad = 23.44 * rad * Math.sin(((2 * Math.PI) / 365) * (dayOfYear - 81));
+  const latRad = Math.max(-65, Math.min(65, lat)) * rad;
+
+  const cosH0 =
+    (Math.cos(90.833 * rad) - Math.sin(latRad) * Math.sin(declRad)) /
+    (Math.cos(latRad) * Math.cos(declRad) || 1e-6);
+  const clampedCos = Math.max(-0.98, Math.min(0.98, cosH0));
+  const halfDayHours = (Math.acos(clampedCos) / rad) / 15;
+
+  // Approximate standard local timezone offset from longitude (e.g. Moscow/Istra ~37E -> UTC+3)
+  const tzOffsetHours = Math.round(lng / 15);
+  const solarNoonLocal = 12 + tzOffsetHours - lng / 15 - eqTimeMin / 60;
+  const sunriseHour = Math.max(2, Math.min(11.5, solarNoonLocal - halfDayHours));
+  const sunsetHour = Math.max(12.5, Math.min(23, solarNoonLocal + halfDayHours));
+
+  return {
+    sunriseHour: Number(sunriseHour.toFixed(2)),
+    sunsetHour: Number(sunsetHour.toFixed(2)),
+    sunriseStr: formatHourMinute(sunriseHour),
+    sunsetStr: formatHourMinute(sunsetHour),
+  };
+}
+
+export function computeSolunarBoost(
+  date: Date,
+  hour: number,
+  moonIllumination: number
+): { boost: number; isMajor: boolean } {
+  const synodic = 29.53058867;
+  const ref = Date.UTC(2024, 0, 11, 11, 57, 0);
+  const days = (date.getTime() - ref) / 86400000;
+  const age = ((days % synodic) + synodic) % synodic;
+  const lunarTransit = (((age / synodic) * 24 + 12) % 24 + 24) % 24;
+
+  const circDist = (a: number, b: number) => {
+    const diff = Math.abs(a - b) % 24;
+    return Math.min(diff, 24 - diff);
+  };
+
+  const dMajor = Math.min(circDist(hour, lunarTransit), circDist(hour, (lunarTransit + 12) % 24));
+  const dMinor = Math.min(
+    circDist(hour, (lunarTransit + 6) % 24),
+    circDist(hour, (lunarTransit + 18) % 24)
+  );
+
+  let boost = 0;
+  let isMajor = false;
+  if (dMajor <= 1.6) {
+    boost += 3;
+    isMajor = true;
+  } else if (dMinor <= 1.4) {
+    boost += 1.5;
+  }
+
+  // Spring tide effect near new moon or full moon
+  if (moonIllumination <= 12 || moonIllumination >= 88) {
+    boost += 2;
+  } else if (moonIllumination >= 42 && moonIllumination <= 58) {
+    boost -= 1;
+  }
+
+  return { boost: Math.max(-2, Math.min(5, Math.round(boost))), isMajor };
+}
+
+export function estimateWaterTempC(
+  weather: WeatherSnapshot,
+  waterBody?: Pick<WaterBody, 'type' | 'avg_depth_m' | 'max_depth_m' | 'connected_to'> | null
+): { waterTempC: number; isIceRegime: boolean } {
+  const tAir = weather.air_temp_c;
+  const t7 = weather.avg_air_temp_7d_c;
+  const t14 = weather.avg_air_temp_14d_c;
+
+  const avgDepth = waterBody?.avg_depth_m ?? (waterBody?.max_depth_m ? waterBody.max_depth_m * 0.45 : 3.5);
+  const isFlowing = waterBody?.type === 'river' || Boolean(waterBody?.connected_to);
+  const isShallow = waterBody?.type === 'pond' || waterBody?.type === 'oxbow' || avgDepth < 2.5;
+  const isDeep = waterBody?.type === 'reservoir' || waterBody?.type === 'quarry' || avgDepth >= 5.0;
+
+  let baseWater: number;
+  if (typeof t7 === 'number' && typeof t14 === 'number') {
+    if (isDeep) {
+      // High thermal inertia for deep reservoirs/quarries
+      baseWater = t14 * 0.68 + t7 * 0.22 + tAir * 0.1 + 1.2;
+    } else if (isShallow) {
+      // Faster thermal response for shallow ponds/oxbows
+      baseWater = t7 * 0.55 + t14 * 0.22 + tAir * 0.23 + 0.6;
+    } else {
+      baseWater = t14 * 0.45 + t7 * 0.35 + tAir * 0.2 + 0.9;
+    }
+    if (isFlowing) {
+      if (baseWater > 18) baseWater -= 1.3;
+      else if (baseWater < 3.5) baseWater += 0.8;
+    }
+  } else {
+    baseWater = weather.water_temp_c;
+    if (isDeep && tAir < baseWater - 3) baseWater += 0.7;
+    if (isFlowing && baseWater > 18) baseWater -= 0.8;
+  }
+
+  const isIceRegime =
+    typeof t7 === 'number'
+      ? isFlowing
+        ? t7 <= -5.5 && tAir <= -1
+        : isShallow
+          ? t7 <= -1.8 && tAir <= 0.5
+          : t7 <= -3.0 && tAir <= 0.5
+      : tAir <= -4.5 && weather.water_temp_c <= 2.0;
+
+  if (isIceRegime) {
+    // Under-ice water stays near 1.2..2.6 C regardless of harsh air frost
+    const underIce = isDeep ? 2.4 : isShallow ? 1.4 : 1.8;
+    return { waterTempC: Number(underIce.toFixed(1)), isIceRegime: true };
+  }
+
+  const clamped = Math.max(0.8, Math.min(28.5, baseWater));
+  return { waterTempC: Number(clamped.toFixed(1)), isIceRegime: false };
+}
+
+export function analyzeBarometricWindow(
+  hourly: HourlyWeatherPoint[] | undefined,
+  targetTimeMs: number,
+  fallbackWeather: WeatherSnapshot
+): {
+  pressureHpa: number;
+  delta6h: number;
+  delta12h: number;
+  stability48h: number;
+  trend: WeatherSnapshot['pressure_trend'];
+} {
+  if (!hourly || hourly.length < 3) {
+    const delta6h =
+      fallbackWeather.pressure_delta_6h ??
+      (fallbackWeather.pressure_trend === 'rising'
+        ? 1.8
+        : fallbackWeather.pressure_trend === 'falling'
+          ? -1.8
+          : 0);
+    const stability48h =
+      fallbackWeather.pressure_stability_48h ??
+      (fallbackWeather.pressure_trend === 'steady' ? 0.84 : 0.58);
+    return {
+      pressureHpa: fallbackWeather.pressure_hpa,
+      delta6h,
+      delta12h: Number((delta6h * 1.4).toFixed(1)),
+      stability48h,
+      trend: fallbackWeather.pressure_trend,
+    };
+  }
+
+  const findClosest = (ms: number): HourlyWeatherPoint => {
+    let best = hourly[0];
+    let bestDiff = Math.abs(Date.parse(best.time) - ms);
+    for (let i = 1; i < hourly.length; i++) {
+      const diff = Math.abs(Date.parse(hourly[i].time) - ms);
+      if (diff < bestDiff) {
+        best = hourly[i];
+        bestDiff = diff;
+      }
+    }
+    return best;
+  };
+
+  const pNow = findClosest(targetTimeMs);
+  const p6 = findClosest(targetTimeMs - 6 * 3600000);
+  const p12 = findClosest(targetTimeMs - 12 * 3600000);
+
+  const delta6h = Number((pNow.pressure_hpa - p6.pressure_hpa).toFixed(1));
+  const delta12h = Number((pNow.pressure_hpa - p12.pressure_hpa).toFixed(1));
+
+  const window48 = hourly.filter((h) => {
+    const t = Date.parse(h.time);
+    return t <= targetTimeMs && t >= targetTimeMs - 48 * 3600000;
+  });
+  let stability48h = fallbackWeather.pressure_stability_48h ?? 0.7;
+  if (window48.length >= 6) {
+    let minP = Infinity;
+    let maxP = -Infinity;
+    for (const h of window48) {
+      if (h.pressure_hpa < minP) minP = h.pressure_hpa;
+      if (h.pressure_hpa > maxP) maxP = h.pressure_hpa;
+    }
+    const range = maxP - minP;
+    stability48h = Number(Math.max(0, Math.min(1, 1 - range / 18)).toFixed(2));
+  }
+
+  const trend: WeatherSnapshot['pressure_trend'] =
+    delta6h >= 1.2 ? 'rising' : delta6h <= -1.2 ? 'falling' : 'steady';
+
+  return {
+    pressureHpa: Math.round(pNow.pressure_hpa),
+    delta6h,
+    delta12h,
+    stability48h,
+    trend,
+  };
+}
+
+export function computeWaterBodyHabitatModifier(params: {
+  waterBody: WaterBody;
+  species: FishSpecies;
+  weather: WeatherSnapshot;
+  isIceRegime?: boolean;
+}): { modifier: number; reasons: string[] } {
+  const { waterBody: wb, species: sp, weather, isIceRegime = false } = params;
+  let modifier = 0;
+  const reasons: string[] = [];
+
+  if (sp.water_types.includes(wb.type)) {
+    modifier += 3;
+    reasons.push(`подходящий тип (${waterBodyTypeRu(wb.type).toLowerCase()})`);
+  } else {
+    modifier -= 18;
+  }
+
+  if (wb.max_depth_m !== null) {
+    if (
+      wb.max_depth_m >= sp.depth_range_m[0] &&
+      (wb.avg_depth_m ?? wb.max_depth_m * 0.5) <= sp.depth_range_m[1] + 2.5
+    ) {
+      modifier += 2;
+      if (wb.has_bathymetry) {
+        reasons.push('глубины и бровки');
+      }
+    } else if (wb.max_depth_m < 0.7 && sp.depth_range_m[0] >= 0.8) {
+      modifier -= 18;
+    }
+  }
+
+  if (wb.ndwi_stability === 'year_round') {
+    modifier += 1;
+  } else if (wb.ndwi_stability === 'seasonal_low') {
+    modifier -= 9;
+  } else {
+    modifier -= 26;
+  }
+
+  if (wb.connected_to) {
+    modifier += 2;
+    reasons.push('проточный водоём');
+  }
+
+  if (wb.vegetation_index === 'algal_bloom') {
+    modifier -= 12;
+  }
+
+  if (wb.has_bathymetry) {
+    modifier += 2;
+  }
+
+  if (wb.confidence < 0.7 || wb.moderation_status === 'unverified') {
+    modifier -= 8;
+  }
+
+  if (sp.id === 'nalim' || sp.id === 'sudak') {
+    if ((wb.max_depth_m ?? 0) >= 6) {
+      modifier += 2;
+    } else if ((wb.max_depth_m ?? 0) < 4) {
+      modifier -= 7;
+    }
+  }
+  if (wb.water_clarity === 'clear' && (sp.id === 'okun' || sp.id === 'pike' || sp.id === 'golavl')) {
+    modifier += 1;
+  } else if (wb.water_clarity === 'murky' && sp.id === 'sudak') {
+    modifier -= 4;
+  }
+
+  if (wb.area_ha >= 1000 && (sp.id === 'sudak' || sp.id === 'pike' || sp.id === 'lesh')) {
+    modifier += 2;
+  } else if (wb.area_ha < 2 && (sp.id === 'sudak' || sp.id === 'nalim')) {
+    modifier -= 12;
+  }
+
+  if (!isIceRegime) {
+    if (wb.area_ha > 800 && weather.wind_speed_ms > 7) {
+      modifier -= 4;
+    } else if (wb.area_ha <= 25 && weather.wind_speed_ms > 5) {
+      modifier += 2;
+      reasons.push('укрыт от ветра');
+    }
+  }
+
+  // Cumulative 72h rain increases river turbidity & runoff
+  const rain72 = weather.recent_rain_72h_mm ?? 0;
+  if (rain72 >= 20 && (wb.type === 'river' || wb.connected_to)) {
+    modifier -= rain72 >= 35 ? 8 : 5;
+    reasons.push('паводковая мутность (−)');
+  }
+
+  return { modifier, reasons };
+}
+
+export function computeReportCalibration(params: {
+  waterBody?: WaterBody | null;
+  species: FishSpecies;
+  weather: WeatherSnapshot;
+  reports?: CatchReport[];
+  baseDate: Date;
+}): {
+  delta: number;
+  reportsUsed: number;
+  catchCount: number;
+  noBiteCount: number;
+  summaryReason: string | null;
+} {
+  const { waterBody, species, weather, reports, baseDate } = params;
+  if (!reports || reports.length === 0) {
+    return { delta: 0, reportsUsed: 0, catchCount: 0, noBiteCount: 0, summaryReason: null };
+  }
+
+  const nowMs = baseDate.getTime();
+  const maxAgeMs = 21 * 86400000;
+  const refPoint: LatLng = waterBody?.center ?? { lat: weather.lat, lng: weather.lng };
+
+  let weightedEvidence = 0;
+  let totalWeight = 0;
+  let reportsUsed = 0;
+  let catchCount = 0;
+  let noBiteCount = 0;
+
+  for (const rep of reports) {
+    const ageMs = nowMs - Date.parse(rep.created_at);
+    if (Number.isNaN(ageMs) || ageMs < -3600000 || ageMs > maxAgeMs) continue;
+
+    // Spatial relevance: exact water body or nearby within 45 km
+    const sameWb = Boolean(waterBody && rep.water_body_id === waterBody.id);
+    const distKm = haversineMeters(refPoint, { lat: rep.lat, lng: rep.lng }) / 1000;
+    let spatialW = 0;
+    if (sameWb) {
+      spatialW = 1.0;
+    } else if (distKm <= 45) {
+      spatialW = 0.45 * Math.exp(-distKm / 30);
+    } else {
+      continue;
+    }
+
+    // Species relevance
+    const sameSpecies = rep.fish_species_id === species.id;
+    const speciesW = sameSpecies ? 1.0 : 0.28;
+    if (!sameSpecies && !sameWb) continue;
+
+    // Exponential recency decay (half-life ~4.5 days)
+    const ageDays = Math.max(0, ageMs / 86400000);
+    const recencyW = Math.exp(-ageDays / 6.5);
+
+    // Weather similarity kernel if report saved a meteo vector
+    let meteoW = 0.72;
+    if (rep.weather_snapshot) {
+      const ws = rep.weather_snapshot;
+      const dP = (ws.pressure_hpa - weather.pressure_hpa) / 8;
+      const dT = (ws.water_temp_c - weather.water_temp_c) / 4.5;
+      const dW = (ws.wind_speed_ms - weather.wind_speed_ms) / 4.0;
+      const trendBonus = ws.pressure_trend === weather.pressure_trend ? 1.0 : 0.78;
+      meteoW = Math.max(0.35, Math.exp(-0.5 * (dP * dP + dT * dT + dW * dW)) * trendBonus);
+    }
+
+    const weight = spatialW * speciesW * recencyW * meteoW;
+    if (weight < 0.05) continue;
+
+    const isNoBite = rep.outcome === 'no_bite';
+    const sign = isNoBite ? -1 : 1;
+    weightedEvidence += sign * weight;
+    totalWeight += weight;
+    reportsUsed += 1;
+    if (isNoBite) noBiteCount += 1;
+    else catchCount += 1;
+  }
+
+  if (reportsUsed === 0) {
+    return { delta: 0, reportsUsed: 0, catchCount: 0, noBiteCount: 0, summaryReason: null };
+  }
+
+  // Bayesian shrinkage toward 0 (prior pseudo-count = 2.0 prevents single-report overreaction)
+  const shrunk = weightedEvidence / (totalWeight + 2.0);
+  const delta = Math.max(-12, Math.min(12, Math.round(shrunk * 16)));
+
+  let summaryReason: string | null = null;
+  if (delta >= 2) {
+    summaryReason = `Калибровка по отчётам: +${delta} (${catchCount} улов.)`;
+  } else if (delta <= -2) {
+    summaryReason = `Калибровка по отчётам: ${delta} (${noBiteCount} без клёва)`;
+  }
+
+  return { delta, reportsUsed, catchCount, noBiteCount, summaryReason };
+}
+
 export function computeFIndexForecast(params: {
   species: FishSpecies;
   weather: WeatherSnapshot;
   baseDate: Date;
+  waterBody?: WaterBody | null;
+  reports?: CatchReport[];
 }): BiteForecastSlot[] {
-  const { species, weather, baseDate } = params;
+  const { species, weather, baseDate, waterBody = null, reports } = params;
   const slots: BiteForecastSlot[] = [];
   const month = baseDate.getMonth() + 1;
   const seasonScore = species.season_activity[month] ?? 55;
   const [optMin, optMax] = species.optimal_water_temp_c;
   const optMid = (optMin + optMax) / 2;
-  const tempDiff = Math.abs(weather.water_temp_c - optMid);
-  const tempFactor = Math.max(0, 22 - tempDiff * 1.8);
 
-  const pressurePenalty =
-    weather.pressure_trend === 'steady'
-      ? 14
-      : weather.pressure_trend === 'rising'
-        ? 9
-        : 3;
+  const { waterTempC, isIceRegime } = estimateWaterTempC(weather, waterBody);
+  const habitat = waterBody
+    ? computeWaterBodyHabitatModifier({ waterBody, species, weather, isIceRegime })
+    : { modifier: 0, reasons: [] };
+  const calibration = computeReportCalibration({
+    waterBody,
+    species,
+    weather,
+    reports,
+    baseDate,
+  });
 
-  const windPenalty = weather.wind_speed_ms > 9 ? -14 : weather.wind_speed_ms >= 2 && weather.wind_speed_ms <= 5 ? 8 : 2;
+  // Under ice, cold-water winter fish (okun, pike, sudak, plotva, lesh, nalim) adapt to ~1.5-2.5 C
+  const winterTolerant = ['pike', 'okun', 'sudak', 'plotva', 'lesh', 'nalim'].includes(species.id);
+  const tempDiff = isIceRegime && winterTolerant
+    ? Math.max(0, Math.abs(waterTempC - 2.0) + 1.5)
+    : Math.abs(waterTempC - optMid);
+  const tempFactor = Math.max(0, 22 - tempDiff * 1.7);
+
   const dayNames = ['Сегодня', 'Завтра', 'Послезавтра'];
   const intervals = ['00:00', '03:00', '06:00', '09:00', '12:00', '15:00', '18:00', '21:00'];
+  const hourly = weather.hourly;
+  const lat = waterBody?.center.lat ?? weather.lat;
+  const lng = waterBody?.center.lng ?? weather.lng;
+  const tzOffsetHours = Math.round(lng / 15);
+
+  const findHourlyForSlot = (slotLocalDateStr: string, hour: number): HourlyWeatherPoint | null => {
+    if (!hourly || hourly.length === 0) return null;
+    const prefix = `${slotLocalDateStr}T${hour.toString().padStart(2, '0')}:`;
+    const exact = hourly.find((h) => h.time.startsWith(prefix));
+    if (exact) return exact;
+    const targetMs = Date.parse(`${slotLocalDateStr}T${hour.toString().padStart(2, '0')}:00:00Z`) - tzOffsetHours * 3600000;
+    let best = hourly[0];
+    let bestDiff = Math.abs(Date.parse(best.time) - targetMs);
+    for (let i = 1; i < hourly.length; i++) {
+      const diff = Math.abs(Date.parse(hourly[i].time) - targetMs);
+      if (diff < bestDiff) {
+        best = hourly[i];
+        bestDiff = diff;
+      }
+    }
+    return bestDiff <= 6 * 3600000 ? best : null;
+  };
 
   for (let dayOffset = 0; dayOffset < 3; dayOffset++) {
     const d = new Date(baseDate.getTime() + dayOffset * 86400000);
     const dateStr = d.toISOString().slice(0, 10);
+    const sun = computeSunTimes(lat, lng, d);
 
     for (let i = 0; i < intervals.length; i++) {
       const hour = i * 3;
-      const isNocturnal = species.id === 'nalim' || species.id === 'som';
-      let timeBoost = 0;
-      if (isNocturnal) {
-        if (hour === 0 || hour === 21) timeBoost = 13;
-        else if (hour === 18 || hour === 3) timeBoost = 8;
-        else timeBoost = -10;
+      const slotWeather = findHourlyForSlot(dateStr, hour);
+      const slotTimeMs = slotWeather
+        ? Date.parse(slotWeather.time)
+        : Date.parse(`${dateStr}T${hour.toString().padStart(2, '0')}:00:00Z`) - tzOffsetHours * 3600000;
+
+      const baro = analyzeBarometricWindow(hourly, slotTimeMs, weather);
+      const slotWind = slotWeather?.wind_speed_ms ?? weather.wind_speed_ms;
+      const slotWindDeg = slotWeather?.wind_direction_deg ?? weather.wind_direction_deg;
+      const slotWindLabel = windDegreesToLabel(slotWindDeg);
+      const slotCloud = slotWeather?.cloud_cover_pct ?? weather.cloud_cover_pct ?? 55;
+      const slotPrecip = slotWeather?.precipitation_mm ?? weather.precipitation_mm;
+      const slotAirTemp = slotWeather?.temp_c ?? weather.air_temp_c;
+
+      // 1. Barometric dynamics (6h velocity + 48h stability)
+      let baroScore = 6;
+      const factors: string[] = [];
+      if (Math.abs(baro.delta6h) >= 4.5) {
+        baroScore = -12;
+        factors.push(`Резкий скачок давления (${baro.delta6h > 0 ? '+' : ''}${baro.delta6h} гПа/6ч) (−)`);
+      } else if (baro.delta6h <= -0.8 && baro.delta6h >= -2.8 && species.category === 'predator') {
+        baroScore = 11;
+        factors.push('Предфронтальное падение давления (+)');
+      } else if (baro.stability48h >= 0.72 && Math.abs(baro.delta6h) < 1.4) {
+        baroScore = 14;
+        factors.push('Стабильное давление 48 ч');
+      } else if (baro.delta6h >= 0.8 && baro.delta6h <= 3.2) {
+        baroScore = 9;
+        factors.push('Устойчивый рост давления');
+      } else if (baro.delta6h < -2.8) {
+        baroScore = -3;
+        factors.push('Быстрое падение давления (−)');
+      } else if (baro.trend === 'steady') {
+        baroScore = 11;
+        factors.push('Ровное давление');
       } else {
-        if (hour === 6 || hour === 9) timeBoost = 15;
-        else if (hour === 18 || hour === 21) timeBoost = 13;
-        else if (hour === 12 || hour === 15) timeBoost = species.category === 'peaceful' ? 4 : 2;
-        else timeBoost = species.id === 'sudak' ? 10 : -10;
+        baroScore = 4;
+        factors.push(baro.trend === 'falling' ? 'Снижение давления (−)' : 'Рост давления');
       }
 
-      // Subtle deterministic variation across the 3 days
-      const wave = Math.round(Math.sin((dayOffset * 8 + i) * 0.65) * 5);
-      const raw = seasonScore * 0.45 + tempFactor + pressurePenalty + windPenalty + timeBoost + wave;
-      const f_index = Math.max(8, Math.min(94, Math.round(raw)));
+      // 2. Wind speed + wind direction
+      let windScore = 0;
+      const windThreshold = isIceRegime ? 11 : 9;
+      if (slotWind > windThreshold) {
+        windScore -= isIceRegime ? 6 : 13;
+        factors.push(`Сильный ветер ${slotWind.toFixed(1)} м/с (−)`);
+      } else if (slotWind >= 1.8 && slotWind <= 5.5) {
+        windScore += 7;
+        factors.push('Умеренный ветер');
+      } else if (slotWind < 1.0 && species.category === 'predator' && !isIceRegime) {
+        windScore -= 2; // Flat calm makes wary predators more cautious
+      } else {
+        windScore += 2;
+      }
 
-      const factors: string[] = [];
-      if (weather.pressure_trend === 'steady') factors.push('Стабильное давление');
-      else if (weather.pressure_trend === 'falling') factors.push('Снижение давления (−)');
-      else factors.push('Рост давления');
+      if (['Ю', 'ЮЗ', 'З'].includes(slotWindLabel)) {
+        windScore += 3;
+      } else if (['С', 'СВ', 'В'].includes(slotWindLabel) && species.id !== 'nalim') {
+        windScore -= 3;
+        factors.push(`Холодный ветер (${slotWindLabel}) (−)`);
+      }
 
-      if (hour === 6 || hour === 18) factors.push('Сумеречная активность');
-      if (weather.wind_speed_ms <= 5) factors.push('Умеренный ветер');
-      else if (weather.wind_speed_ms > 9) factors.push('Сильный ветер (−)');
+      // 3. Cloud cover & precipitation
+      let skyScore = 0;
+      if (slotPrecip >= 3.0) {
+        skyScore -= 9;
+        factors.push('Сильные осадки (−)');
+      } else if (slotPrecip >= 0.2 && slotPrecip <= 1.5 && species.category === 'predator') {
+        skyScore += 3;
+      }
+
+      const isDaylight = hour >= sun.sunriseHour - 0.5 && hour <= sun.sunsetHour + 0.5;
+      if (isDaylight) {
+        if (slotCloud >= 65 && species.category === 'predator') {
+          skyScore += 4;
+          factors.push('Пасмурно — комфортно хищнику');
+        } else if (slotCloud <= 25 && species.category === 'predator' && Math.abs(hour - 12) <= 3 && !isIceRegime) {
+          skyScore -= 4;
+        } else if (slotCloud <= 35 && species.category === 'peaceful' && (month <= 5 || month >= 9)) {
+          skyScore += 3;
+        }
+      }
+
+      // 4. Astronomical dawn/dusk & diurnal activity curve
+      const isNocturnal = species.id === 'nalim' || species.id === 'som';
+      const distToSunrise = Math.abs(hour - sun.sunriseHour);
+      const distToSunset = Math.abs(hour - sun.sunsetHour);
+      let timeBoost = 0;
+
+      if (isNocturnal) {
+        if (!isDaylight) {
+          timeBoost = 13;
+          factors.push('Ночная активность');
+        } else if (distToSunrise <= 1.8 || distToSunset <= 1.8) {
+          timeBoost = 7;
+          factors.push('Сумеречный выход');
+        } else {
+          timeBoost = -10;
+        }
+      } else {
+        if (distToSunrise <= 1.8) {
+          timeBoost = 14;
+          factors.push(`Рассветный пик (${sun.sunriseStr})`);
+        } else if (distToSunset <= 1.8) {
+          timeBoost = 13;
+          factors.push(`Закатный пик (${sun.sunsetStr})`);
+        } else if (isDaylight) {
+          // Winter/cold days often peak closer to midday warming
+          timeBoost = isIceRegime ? 6 : species.category === 'peaceful' ? 4 : 2;
+        } else {
+          timeBoost = species.id === 'sudak' ? 9 : -10;
+        }
+      }
+
+      // 5. Solunar minor/major transit micro-modifier
+      const solunar = computeSolunarBoost(d, hour, weather.moon_illumination);
+      if (solunar.isMajor) {
+        factors.push('Солунарный пик');
+      }
+
+      if (isIceRegime) {
+        factors.push('Ледовый режим');
+      }
+      if (calibration.summaryReason) {
+        factors.push(calibration.summaryReason);
+      }
+
+      // Slight habitat & calibration shift applied smoothly (avoid overwhelming base curve)
+      const habitatShift = waterBody ? Math.max(-18, Math.min(8, Math.round(habitat.modifier * 0.6))) : 0;
+
+      const raw =
+        seasonScore * 0.42 +
+        tempFactor +
+        baroScore +
+        windScore +
+        skyScore +
+        timeBoost +
+        solunar.boost +
+        habitatShift +
+        calibration.delta;
+
+      const f_index = Math.max(8, Math.min(95, Math.round(raw)));
 
       slots.push({
         date: dateStr,
@@ -216,11 +773,82 @@ export function computeFIndexForecast(params: {
         hour_interval: intervals[i],
         f_index,
         probability_label: probabilityLabelFromScore(f_index),
-        factors,
+        factors: factors.slice(0, 4),
+        temp_c: Number(slotAirTemp.toFixed(1)),
+        wind_speed_ms: Number(slotWind.toFixed(1)),
+        pressure_mmhg: Math.round(baro.pressureHpa * 0.75006),
+        cloud_cover_pct: Math.round(slotCloud),
       });
     }
   }
   return slots;
+}
+
+export function buildBiteForecastMetadata(params: {
+  weather: WeatherSnapshot;
+  species: FishSpecies;
+  waterBody?: WaterBody | null;
+  reports?: CatchReport[];
+  baseDate: Date;
+}): Pick<
+  BiteForecastResponse,
+  | 'confidence_level'
+  | 'confidence_score'
+  | 'confidence_label'
+  | 'calibration_delta'
+  | 'calibration_reports_used'
+  | 'regime'
+  | 'sunrise'
+  | 'sunset'
+  | 'estimated_water_temp_c'
+> {
+  const { weather, species, waterBody = null, reports, baseDate } = params;
+  const lat = waterBody?.center.lat ?? weather.lat;
+  const lng = waterBody?.center.lng ?? weather.lng;
+  const sun = computeSunTimes(lat, lng, baseDate);
+  const { waterTempC, isIceRegime } = estimateWaterTempC(weather, waterBody);
+  const calibration = computeReportCalibration({ waterBody, species, weather, reports, baseDate });
+
+  const hasHourly = Boolean(weather.hourly && weather.hourly.length >= 24);
+  const has14dHistory = typeof weather.avg_air_temp_14d_c === 'number';
+  const isLive = weather.source !== 'offline-fallback';
+
+  let score = isLive ? (hasHourly && has14dHistory ? 76 : 62) : 38;
+  if (waterBody && waterBody.moderation_status === 'verified') score += 6;
+  if (waterBody?.has_bathymetry) score += 4;
+  if (calibration.reportsUsed > 0) {
+    score += Math.min(12, calibration.reportsUsed * 4);
+  }
+  score = Math.max(25, Math.min(96, score));
+
+  const level: 'high' | 'medium' | 'low' = score >= 75 ? 'high' : score >= 52 ? 'medium' : 'low';
+  const parts: string[] = [];
+  if (isLive && hasHourly) parts.push('почасовой Open-Meteo (14 дн.)');
+  else if (isLive) parts.push('текущий Open-Meteo');
+  else parts.push('офлайн-модель');
+
+  if (calibration.reportsUsed > 0) {
+    parts.push(`калибровка по ${calibration.reportsUsed} отч.`);
+  }
+
+  const prefix =
+    level === 'high'
+      ? 'Высокая точность'
+      : level === 'medium'
+        ? 'Средняя точность'
+        : 'Ориентировочно';
+
+  return {
+    confidence_level: level,
+    confidence_score: score,
+    confidence_label: `${prefix}: ${parts.join(' + ')}`,
+    calibration_delta: calibration.delta,
+    calibration_reports_used: calibration.reportsUsed,
+    regime: isIceRegime ? 'ice' : 'open_water',
+    sunrise: sun.sunriseStr,
+    sunset: sun.sunsetStr,
+    estimated_water_temp_c: waterTempC,
+  };
 }
 
 export function evaluateGoodBiteWaterBodies(params: {
@@ -256,7 +884,7 @@ export function evaluateGoodBiteWaterBodies(params: {
       : speciesList;
   if (targetSpeciesPool.length === 0) return [];
 
-  // Precompute meteorological peak F-Index per species for the chosen day
+  // Precompute baseline meteorological peak per species for the chosen day
   const speciesPeakMap = new Map<string, { peak: BiteForecastSlot; species: FishSpecies }>();
   for (const sp of targetSpeciesPool) {
     const slots = computeFIndexForecast({ species: sp, weather, baseDate }).filter(
@@ -278,110 +906,42 @@ export function evaluateGoodBiteWaterBodies(params: {
     const distKm = Number((haversineMeters(origin, wb.center) / 1000).toFixed(1));
     if (distKm > radiusKm) continue;
 
+    const { isIceRegime } = estimateWaterTempC(weather, wb);
     let bestCandidate: GoodBiteWaterBodyItem | null = null;
 
     for (const sp of targetSpeciesPool) {
       const entry = speciesPeakMap.get(sp.id);
       if (!entry) continue;
 
-      let modifier = 0;
-      const reasons: string[] = [];
+      const { modifier: habMod, reasons } = computeWaterBodyHabitatModifier({
+        waterBody: wb,
+        species: sp,
+        weather,
+        isIceRegime,
+      });
+      let modifier = habMod;
 
-      // Habitat type match
-      if (sp.water_types.includes(wb.type)) {
-        modifier += 3;
-        reasons.push(`подходящий тип (${waterBodyTypeRu(wb.type).toLowerCase()})`);
-      } else {
-        modifier -= 18;
+      // Calibrate with recent catch AND no_bite reports
+      const calibration = computeReportCalibration({
+        waterBody: wb,
+        species: sp,
+        weather,
+        reports,
+        baseDate,
+      });
+      modifier += calibration.delta;
+      if (calibration.summaryReason) {
+        reasons.push(calibration.summaryReason);
       }
 
-      // Depth compatibility
-      if (wb.max_depth_m !== null) {
-        if (
-          wb.max_depth_m >= sp.depth_range_m[0] &&
-          (wb.avg_depth_m ?? wb.max_depth_m * 0.5) <= sp.depth_range_m[1] + 2.5
-        ) {
-          modifier += 2;
-          if (wb.has_bathymetry) {
-            reasons.push('глубины и бровки');
-          }
-        } else if (wb.max_depth_m < 0.7 && sp.depth_range_m[0] >= 0.8) {
-          modifier -= 18;
-        }
-      }
-
-      // Hydrological & NDWI stability
-      if (wb.ndwi_stability === 'year_round') {
-        modifier += 1;
-      } else if (wb.ndwi_stability === 'seasonal_low') {
-        modifier -= 9;
-      } else {
-        modifier -= 26;
-      }
-
-      if (wb.connected_to) {
-        modifier += 2;
-        reasons.push('проточный водоём');
-      }
-
-      if (wb.vegetation_index === 'algal_bloom') {
-        modifier -= 12;
-      }
-
-      if (wb.has_bathymetry) {
-        modifier += 2;
-      }
-
-      if (wb.confidence < 0.7 || wb.moderation_status === 'unverified') {
-        modifier -= 8;
-      }
-
-      // Depth & water clarity synergy
-      if (sp.id === 'nalim' || sp.id === 'sudak') {
-        if ((wb.max_depth_m ?? 0) >= 6) {
-          modifier += 2;
-        } else if ((wb.max_depth_m ?? 0) < 4) {
-          modifier -= 7;
-        }
-      }
-      if (wb.water_clarity === 'clear' && (sp.id === 'okun' || sp.id === 'pike' || sp.id === 'golavl')) {
-        modifier += 1;
-      } else if (wb.water_clarity === 'murky' && sp.id === 'sudak') {
-        modifier -= 4;
-      }
-
-      // Large open-water affinity vs wind shelter
-      if (wb.area_ha >= 1000 && (sp.id === 'sudak' || sp.id === 'pike' || sp.id === 'lesh')) {
-        modifier += 2;
-      } else if (wb.area_ha < 2 && (sp.id === 'sudak' || sp.id === 'nalim')) {
-        modifier -= 12;
-      }
-
-      if (wb.area_ha > 800 && weather.wind_speed_ms > 7) {
-        modifier -= 4;
-      } else if (wb.area_ha <= 25 && weather.wind_speed_ms > 5) {
-        modifier += 2;
-        reasons.push('укрыт от ветра');
-      }
-
-      // Subtle deterministic micro-relief adjustment (-3..+2) from water body geometry
-      const microRelief = (Math.round((wb.center.lat * 100 + wb.center.lng * 100) % 6) - 3);
-      modifier += microRelief;
-
-      // Recent crowd reports on this water body
-      const wbReports = reports.filter(
+      const wbCatchReports = reports.filter(
         (r) =>
           r.water_body_id === wb.id &&
           r.visibility !== 'private' &&
+          r.outcome !== 'no_bite' &&
           new Date(r.created_at).getTime() >= recentThresholdMs
       );
-      const matchingSpeciesReports = wbReports.filter((r) => r.fish_species_id === sp.id);
-      if (matchingSpeciesReports.length > 0) {
-        modifier += Math.min(8, matchingSpeciesReports.length * 4);
-        reasons.push(`свежие отчёты (${matchingSpeciesReports.length})`);
-      } else if (wbReports.length > 0 && fishId === 'all') {
-        modifier += Math.min(3, wbReports.length * 1);
-      }
+      const matchingSpeciesReports = wbCatchReports.filter((r) => r.fish_species_id === sp.id);
 
       if (weather.pressure_trend === 'steady') {
         reasons.push('стабильное давление');
@@ -389,7 +949,7 @@ export function evaluateGoodBiteWaterBodies(params: {
         reasons.push('рост давления');
       }
 
-      const finalScore = Math.max(8, Math.min(94, Math.round(entry.peak.f_index + modifier)));
+      const finalScore = Math.max(8, Math.min(95, Math.round(entry.peak.f_index + modifier)));
       const candidate: GoodBiteWaterBodyItem = {
         water_body: wb,
         distance_km: distKm,
@@ -631,31 +1191,47 @@ export function recommendLures(params: {
   waterBody: WaterBody | null;
   month: number;
   clarity?: WaterBody['water_clarity'];
+  isIceRegime?: boolean;
 }): LureRecommendationResult[] {
-  const { species, waterBody, month, clarity = waterBody?.water_clarity ?? 'moderate' } = params;
+  const {
+    species,
+    waterBody,
+    month,
+    clarity = waterBody?.water_clarity ?? 'moderate',
+    isIceRegime = false,
+  } = params;
   const wbDepth = waterBody?.avg_depth_m ?? ((species.depth_range_m[0] + species.depth_range_m[1]) / 2);
 
   return species.lures
     .map((lure) => {
-      let score = lure.base_rank * 10;
+      let rawScore = lure.base_rank * 8;
       const reasons: string[] = [];
 
+      if (isIceRegime) {
+        if (lure.category === 'мормышка' || lure.category === 'балансир') {
+          rawScore += 26;
+          reasons.push('подходит для подлёдной ловли');
+        } else if (lure.category === 'воблер' || lure.category === 'фидер') {
+          rawScore -= 38;
+        }
+      }
+
       if (lure.best_seasons.includes(month)) {
-        score += 18;
+        rawScore += 16;
         reasons.push('подходит для текущего сезона');
       } else {
-        score -= 8;
+        rawScore -= 8;
       }
 
       if (wbDepth >= lure.depth_min_m && wbDepth <= lure.depth_max_m) {
-        score += 16;
+        rawScore += 14;
         reasons.push(`рабочий горизонт ${lure.depth_min_m}–${lure.depth_max_m} м`);
       } else {
-        score -= 10;
+        rawScore -= 10;
       }
 
       if (lure.best_clarity.includes(clarity)) {
-        score += 10;
+        rawScore += 8;
         reasons.push(
           clarity === 'clear'
             ? 'для прозрачной воды'
@@ -666,17 +1242,21 @@ export function recommendLures(params: {
       }
 
       if (waterBody && lure.water_types.includes(waterBody.type)) {
-        score += 12;
+        rawScore += 10;
         reasons.push(`эффективна на типе «${waterBodyTypeRu(waterBody.type)}»`);
       }
 
       return {
-        lure,
-        score: Math.max(10, Math.min(99, Math.round(score))),
-        reasons: reasons.length > 0 ? reasons : [lure.rationale],
+        rawScore,
+        result: {
+          lure,
+          score: Math.max(10, Math.min(99, Math.round(rawScore))),
+          reasons: reasons.length > 0 ? reasons : [lure.rationale],
+        },
       };
     })
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => b.rawScore - a.rawScore)
+    .map((item) => item.result);
 }
 
 export function waterBodyTypeRu(t: WaterBody['type']): string {

@@ -4,6 +4,7 @@ import { resolveReportPhotoUrl } from '../utils/samplePhotos';
 import type {
   CatchReport,
   FishSpecies,
+  ReportOutcome,
   ReportVisibility,
   SyncQueueItem,
   UserProfile,
@@ -27,6 +28,7 @@ interface DiaryAndProfileProps {
     water_body_id: string | null;
     lat: number;
     lng: number;
+    outcome: ReportOutcome;
     weight_kg: number | null;
     length_cm: number | null;
     bait: string;
@@ -62,6 +64,7 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
   onAuthLogout,
   onUpdatePrivacy,
 }) => {
+  const [outcome, setOutcome] = useState<ReportOutcome>('catch');
   const [speciesId, setSpeciesId] = useState(speciesList[0]?.id ?? 'pike');
   const [wbId, setWbId] = useState(waterBodies[0]?.id ?? '');
   const [weight, setWeight] = useState('1.8');
@@ -83,12 +86,15 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
   const [authError, setAuthError] = useState<string | null>(null);
 
   const diaryReports = reports;
-  const weights = diaryReports.map((r) => r.weight_kg).filter((w): w is number => typeof w === 'number');
+  const weights = diaryReports
+    .filter((r) => r.outcome !== 'no_bite')
+    .map((r) => r.weight_kg)
+    .filter((w): w is number => typeof w === 'number');
   const avgWeight = weights.length > 0 ? (weights.reduce((a, b) => a + b, 0) / weights.length).toFixed(2) : '—';
 
   const baitCounts = new Map<string, number>();
   for (const r of diaryReports) {
-    if (r.bait) baitCounts.set(r.bait, (baitCounts.get(r.bait) ?? 0) + 1);
+    if (r.bait && r.outcome !== 'no_bite') baitCounts.set(r.bait, (baitCounts.get(r.bait) ?? 0) + 1);
   }
   const topBait = [...baitCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'Виброхвост 12 см';
 
@@ -156,15 +162,16 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
       water_body_id: wb?.id ?? null,
       lat: wb?.center.lat ?? 55.975,
       lng: wb?.center.lng ?? 36.825,
-      weight_kg: parsedW !== null && !Number.isNaN(parsedW) ? parsedW : null,
-      length_cm: parsedL !== null && !Number.isNaN(parsedL) ? parsedL : null,
+      outcome,
+      weight_kg: outcome === 'no_bite' ? null : parsedW !== null && !Number.isNaN(parsedW) ? parsedW : null,
+      length_cm: outcome === 'no_bite' ? null : parsedL !== null && !Number.isNaN(parsedL) ? parsedL : null,
       bait,
       retrieve,
       notes,
       visibility,
-      photo_url: photoData?.url ?? null,
-      photo_size_bytes: photoData?.size,
-      photo_mime: photoData?.mime,
+      photo_url: outcome === 'no_bite' ? null : photoData?.url ?? null,
+      photo_size_bytes: outcome === 'no_bite' ? undefined : photoData?.size,
+      photo_mime: outcome === 'no_bite' ? undefined : photoData?.mime,
     });
     if (err) {
       setFormError(err);
@@ -320,6 +327,31 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
               )}
             </div>
 
+            <div className="grid grid-cols-2 gap-1.5 rounded-xl bg-slate-100 p-1 dark:bg-slate-800" role="group" aria-label="Итог рыбалки">
+              <button
+                type="button"
+                onClick={() => setOutcome('catch')}
+                className={`min-h-[36px] rounded-lg px-2 py-1 text-xs font-semibold transition-colors ${
+                  outcome === 'catch'
+                    ? 'bg-white text-teal-700 shadow-sm dark:bg-slate-700 dark:text-teal-300'
+                    : 'text-slate-600 hover:text-slate-900 dark:text-slate-400'
+                }`}
+              >
+                Улов / поклёвки
+              </button>
+              <button
+                type="button"
+                onClick={() => setOutcome('no_bite')}
+                className={`min-h-[36px] rounded-lg px-2 py-1 text-xs font-semibold transition-colors ${
+                  outcome === 'no_bite'
+                    ? 'bg-white text-amber-700 shadow-sm dark:bg-slate-700 dark:text-amber-300'
+                    : 'text-slate-600 hover:text-slate-900 dark:text-slate-400'
+                }`}
+              >
+                Был на водоёме — клёва нет
+              </button>
+            </div>
+
             {formError && (
               <div role="alert" className="rounded-xl bg-rose-50 px-3.5 py-2 text-xs font-medium text-rose-800">
                 {formError}
@@ -329,7 +361,7 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div>
                 <label htmlFor="diary-species" className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-                  Вид рыбы
+                  {outcome === 'no_bite' ? 'Целевой вид рыбы' : 'Вид рыбы'}
                 </label>
                 <select
                   id="diary-species"
@@ -364,35 +396,39 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
             </div>
 
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <div>
-                <label htmlFor="diary-weight" className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-                  Вес, кг
-                </label>
-                <input
-                  id="diary-weight"
-                  type="text"
-                  inputMode="decimal"
-                  value={weight}
-                  onChange={(e) => setWeight(e.target.value)}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-sm dark:border-slate-700 dark:bg-slate-800"
-                />
-              </div>
-              <div>
-                <label htmlFor="diary-len" className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-                  Длина, см
-                </label>
-                <input
-                  id="diary-len"
-                  type="text"
-                  inputMode="decimal"
-                  value={lengthCm}
-                  onChange={(e) => setLengthCm(e.target.value)}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-sm dark:border-slate-700 dark:bg-slate-800"
-                />
-              </div>
-              <div className="col-span-2">
+              {outcome === 'catch' && (
+                <>
+                  <div>
+                    <label htmlFor="diary-weight" className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      Вес, кг
+                    </label>
+                    <input
+                      id="diary-weight"
+                      type="text"
+                      inputMode="decimal"
+                      value={weight}
+                      onChange={(e) => setWeight(e.target.value)}
+                      className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-sm dark:border-slate-700 dark:bg-slate-800"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="diary-len" className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      Длина, см
+                    </label>
+                    <input
+                      id="diary-len"
+                      type="text"
+                      inputMode="decimal"
+                      value={lengthCm}
+                      onChange={(e) => setLengthCm(e.target.value)}
+                      className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-sm dark:border-slate-700 dark:bg-slate-800"
+                    />
+                  </div>
+                </>
+              )}
+              <div className={outcome === 'no_bite' ? 'col-span-2 sm:col-span-4' : 'col-span-2'}>
                 <label htmlFor="diary-bait" className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-                  Приманка / наживка
+                  {outcome === 'no_bite' ? 'Что пробовали (приманки / снасть)' : 'Приманка / наживка'}
                 </label>
                 <input
                   id="diary-bait"
@@ -508,11 +544,18 @@ export const DiaryAndProfile: React.FC<DiaryAndProfileProps> = ({
                   <div className="flex-1 min-w-0">
                     <div className="flex items-start justify-between gap-2">
                       <div>
-                        <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                          {rep.fish_species_name}
-                          {rep.weight_kg !== null ? ` · ${rep.weight_kg} кг` : ''}
-                          {rep.length_cm !== null ? ` · ${rep.length_cm} см` : ''}
-                        </h3>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                            {rep.fish_species_name}
+                            {rep.outcome !== 'no_bite' && rep.weight_kg !== null ? ` · ${rep.weight_kg} кг` : ''}
+                            {rep.outcome !== 'no_bite' && rep.length_cm !== null ? ` · ${rep.length_cm} см` : ''}
+                          </h3>
+                          {rep.outcome === 'no_bite' && (
+                            <span className="rounded-md bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
+                              Без поклёвок (калибровка)
+                            </span>
+                          )}
+                        </div>
                         <p className="mt-0.5 text-xs text-slate-500">
                           {rep.water_body_name} · {rep.author_nickname} ·{' '}
                           {new Date(rep.created_at).toLocaleString('ru-RU', {

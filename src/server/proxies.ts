@@ -1,15 +1,19 @@
 import { GoogleGenAI, Type } from '@google/genai';
 import {
+  buildBiteForecastMetadata,
   buildSplitRouteMetrics,
   computeFIndexForecast,
   decodePolyline6,
+  estimateWaterTempC,
   findInteriorWaterPoint,
   haversineMeters,
   windDegreesToLabel,
 } from '../lib/fishLogic.ts';
 import type {
   BiteForecastResponse,
+  CatchReport,
   FishSpecies,
+  HourlyWeatherPoint,
   LatLng,
   RouteMultiResult,
   WaterBody,
@@ -50,56 +54,151 @@ export async function fetchWeatherViaProxy(lat: number, lng: number): Promise<We
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3500);
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(4)}&longitude=${lng.toFixed(4)}&current=temperature_2m,precipitation,surface_pressure,wind_speed_10m,wind_direction_10m&hourly=surface_pressure&forecast_days=1&wind_speed_unit=ms`;
+    const timeout = setTimeout(() => controller.abort(), 4500);
+    const url =
+      `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(4)}&longitude=${lng.toFixed(4)}` +
+      `&current=temperature_2m,precipitation,pressure_msl,surface_pressure,cloud_cover,wind_speed_10m,wind_direction_10m` +
+      `&hourly=temperature_2m,pressure_msl,wind_speed_10m,wind_direction_10m,cloud_cover,precipitation` +
+      `&past_days=14&forecast_days=3&wind_speed_unit=ms&timezone=auto`;
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timeout);
 
     if (res.ok) {
       const json = (await res.json()) as {
         current?: {
+          time?: string;
           temperature_2m?: number;
           precipitation?: number;
+          pressure_msl?: number;
           surface_pressure?: number;
+          cloud_cover?: number;
           wind_speed_10m?: number;
           wind_direction_10m?: number;
         };
-        hourly?: { surface_pressure?: number[] };
+        hourly?: {
+          time?: string[];
+          temperature_2m?: number[];
+          pressure_msl?: number[];
+          wind_speed_10m?: number[];
+          wind_direction_10m?: number[];
+          cloud_cover?: number[];
+          precipitation?: number[];
+        };
       };
       const cur = json.current;
       if (cur && typeof cur.temperature_2m === 'number') {
-        const pressureHpa = Math.round(cur.surface_pressure ?? 1014);
-        const pressureMmhg = Math.round(pressureHpa * 0.75006);
-        const hourlyP = json.hourly?.surface_pressure ?? [];
-        let trend: WeatherSnapshot['pressure_trend'] = 'steady';
-        if (hourlyP.length >= 6) {
-          const delta = hourlyP[hourlyP.length - 1] - hourlyP[0];
-          if (delta > 2.5) trend = 'rising';
-          else if (delta < -2.5) trend = 'falling';
+        const hTime = json.hourly?.time ?? [];
+        const hTemp = json.hourly?.temperature_2m ?? [];
+        const hPres = json.hourly?.pressure_msl ?? [];
+        const hWind = json.hourly?.wind_speed_10m ?? [];
+        const hWDir = json.hourly?.wind_direction_10m ?? [];
+        const hCloud = json.hourly?.cloud_cover ?? [];
+        const hPrecip = json.hourly?.precipitation ?? [];
+
+        // Locate current hour index in the 17-day hourly array
+        const curPrefix = (cur.time ?? now.toISOString()).slice(0, 13);
+        let curIdx = hTime.findIndex((t) => t.startsWith(curPrefix));
+        if (curIdx < 0) {
+          curIdx = Math.max(0, Math.min(hTime.length - 1, 14 * 24));
         }
+
+        // Compute 7-day and 14-day mean air temperatures for thermal water inertia
+        const sliceMean = (arr: number[], start: number, end: number): number | undefined => {
+          const s = Math.max(0, start);
+          const e = Math.min(arr.length, end);
+          if (e <= s) return undefined;
+          let sum = 0;
+          let count = 0;
+          for (let i = s; i < e; i++) {
+            if (typeof arr[i] === 'number' && !Number.isNaN(arr[i])) {
+              sum += arr[i];
+              count += 1;
+            }
+          }
+          return count > 0 ? Number((sum / count).toFixed(1)) : undefined;
+        };
+
+        const avg7d = sliceMean(hTemp, curIdx - 7 * 24, curIdx + 1);
+        const avg14d = sliceMean(hTemp, curIdx - 14 * 24, curIdx + 1);
+
+        // Cumulative rainfall over last 72 hours (for river turbidity)
+        let rain72h = 0;
+        for (let i = Math.max(0, curIdx - 72); i <= Math.min(hPrecip.length - 1, curIdx); i++) {
+          rain72h += Number(hPrecip[i] ?? 0);
+        }
+
+        // Current 6h barometric delta and 48h stability
+        const pressureHpa = Math.round(cur.pressure_msl ?? cur.surface_pressure ?? hPres[curIdx] ?? 1014);
+        const pressureMmhg = Math.round(pressureHpa * 0.75006);
+        const p6Ago = curIdx >= 6 && typeof hPres[curIdx - 6] === 'number' ? hPres[curIdx - 6] : pressureHpa;
+        const delta6h = Number((pressureHpa - p6Ago).toFixed(1));
+        const trend: WeatherSnapshot['pressure_trend'] =
+          delta6h >= 1.2 ? 'rising' : delta6h <= -1.2 ? 'falling' : 'steady';
+
+        let stability48h = 0.75;
+        const p48Start = Math.max(0, curIdx - 48);
+        if (curIdx - p48Start >= 6) {
+          let minP = Infinity;
+          let maxP = -Infinity;
+          for (let i = p48Start; i <= curIdx; i++) {
+            const p = hPres[i];
+            if (typeof p === 'number') {
+              if (p < minP) minP = p;
+              if (p > maxP) maxP = p;
+            }
+          }
+          if (minP < Infinity) {
+            stability48h = Number(Math.max(0, Math.min(1, 1 - (maxP - minP) / 18)).toFixed(2));
+          }
+        }
+
+        // Keep compact window: 48h past + 72h future (~120 hourly points)
+        const hourlyCompact: HourlyWeatherPoint[] = [];
+        const winStart = Math.max(0, curIdx - 48);
+        const winEnd = Math.min(hTime.length, curIdx + 76);
+        for (let i = winStart; i < winEnd; i++) {
+          hourlyCompact.push({
+            time: hTime[i],
+            temp_c: Number((hTemp[i] ?? cur.temperature_2m).toFixed(1)),
+            pressure_hpa: Number((hPres[i] ?? pressureHpa).toFixed(1)),
+            wind_speed_ms: Number((hWind[i] ?? cur.wind_speed_10m ?? 3.2).toFixed(1)),
+            wind_direction_deg: Math.round(hWDir[i] ?? cur.wind_direction_10m ?? 220),
+            cloud_cover_pct: Math.round(hCloud[i] ?? cur.cloud_cover ?? 55),
+            precipitation_mm: Number((hPrecip[i] ?? 0).toFixed(1)),
+          });
+        }
+
         const airTemp = Number(cur.temperature_2m.toFixed(1));
-        const waterTemp = Number(Math.max(1.5, airTemp * 0.72 + 2.4).toFixed(1));
         const windDeg = Math.round(cur.wind_direction_10m ?? 220);
 
-        const snapshot: WeatherSnapshot = {
+        const baseSnapshot: WeatherSnapshot = {
           lat,
           lng,
           captured_at: now.toISOString(),
           pressure_hpa: pressureHpa,
           pressure_mmhg: pressureMmhg,
           pressure_trend: trend,
+          pressure_delta_6h: delta6h,
+          pressure_stability_48h: stability48h,
           air_temp_c: airTemp,
-          water_temp_c: waterTemp,
+          water_temp_c: Number(Math.max(1.0, (avg14d ?? airTemp) * 0.78 + 1.4).toFixed(1)),
+          avg_air_temp_7d_c: avg7d,
+          avg_air_temp_14d_c: avg14d,
           wind_speed_ms: Number((cur.wind_speed_10m ?? 3.2).toFixed(1)),
           wind_direction_deg: windDeg,
           wind_direction_label: windDegreesToLabel(windDeg),
+          cloud_cover_pct: Math.round(cur.cloud_cover ?? hCloud[curIdx] ?? 55),
           precipitation_mm: Number((cur.precipitation ?? 0).toFixed(1)),
+          recent_rain_72h_mm: Number(rain72h.toFixed(1)),
           moon_phase: moon.label,
           moon_illumination: moon.illumination,
+          hourly: hourlyCompact,
           source: 'open-meteo',
         };
-        store.weatherCache.set(key, { data: snapshot, expiresAt: Date.now() + 30 * 60 * 1000 });
-        return snapshot;
+        baseSnapshot.water_temp_c = estimateWaterTempC(baseSnapshot).waterTempC;
+
+        store.weatherCache.set(key, { data: baseSnapshot, expiresAt: Date.now() + 30 * 60 * 1000 });
+        return baseSnapshot;
       }
     }
   } catch {
@@ -113,12 +212,18 @@ export async function fetchWeatherViaProxy(lat: number, lng: number): Promise<We
     pressure_hpa: 1015,
     pressure_mmhg: 761,
     pressure_trend: 'steady',
+    pressure_delta_6h: 0,
+    pressure_stability_48h: 0.82,
     air_temp_c: 4.5,
     water_temp_c: 5.8,
+    avg_air_temp_7d_c: 4.8,
+    avg_air_temp_14d_c: 5.4,
     wind_speed_ms: 3.8,
     wind_direction_deg: 235,
     wind_direction_label: 'ЮЗ',
+    cloud_cover_pct: 60,
     precipitation_mm: 0.0,
+    recent_rain_72h_mm: 2.5,
     moon_phase: moon.label,
     moon_illumination: moon.illumination,
     source: 'offline-fallback',
@@ -132,16 +237,28 @@ export async function fetchBiteForecastViaProxy(params: {
   lng: number;
   species: FishSpecies;
   dateStr?: string;
+  waterBody?: WaterBody | null;
+  reports?: CatchReport[];
 }): Promise<BiteForecastResponse> {
-  const { lat, lng, species, dateStr } = params;
+  const { lat, lng, species, dateStr, waterBody = null, reports } = params;
   const baseDate = dateStr ? new Date(dateStr) : new Date();
   const dayKey = baseDate.toISOString().slice(0, 10);
-  const cacheKey = `${lat.toFixed(2)}:${lng.toFixed(2)}:${species.id}:${dayKey}`;
+  const wbKey = waterBody?.id ?? 'generic';
+  const cacheKey = `${lat.toFixed(2)}:${lng.toFixed(2)}:${species.id}:${wbKey}:${dayKey}`;
 
   const cached = store.forecastCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return { ...cached.data, cached: true };
   }
+
+  const weather = await fetchWeatherViaProxy(lat, lng);
+  const meta = buildBiteForecastMetadata({
+    weather,
+    species,
+    waterBody,
+    reports,
+    baseDate,
+  });
 
   // Attempt Actigator API if key is configured on server
   const actigatorKey = process.env.ACTIGATOR_API_KEY;
@@ -165,11 +282,13 @@ export async function fetchBiteForecastViaProxy(params: {
             lng,
             fish_id: species.id,
             fish_name: species.name,
+            water_body_id: waterBody?.id ?? null,
             source: 'actigator',
             cached: false,
             disclaimer:
               'Прогноз рассчитан моделью Actigator. Результат носит вероятностный характер и не гарантирует клёв.',
             slots: external.slots,
+            ...meta,
           };
           store.forecastCache.set(cacheKey, { data: response, expiresAt: Date.now() + 65 * 60 * 1000 });
           return response;
@@ -180,18 +299,19 @@ export async function fetchBiteForecastViaProxy(params: {
     }
   }
 
-  const weather = await fetchWeatherViaProxy(lat, lng);
-  const slots = computeFIndexForecast({ species, weather, baseDate });
+  const slots = computeFIndexForecast({ species, weather, baseDate, waterBody, reports });
   const response: BiteForecastResponse = {
     lat,
     lng,
     fish_id: species.id,
     fish_name: species.name,
+    water_body_id: waterBody?.id ?? null,
     source: 'open-meteo-fallback',
     cached: false,
     disclaimer:
-      'Сервис Actigator недоступен или не настроен — применён расчёт на базе метеоданных Open-Meteo. Прогноз носит вероятностный характер.',
+      'Расчёт на базе почасовых данных Open-Meteo (14 дн. истории + 3 дн. прогноза), барометрической динамики, инерции воды, астрономии и калибровки по отчётам. Носит вероятностный характер.',
     slots,
+    ...meta,
   };
   store.forecastCache.set(cacheKey, { data: response, expiresAt: Date.now() + 65 * 60 * 1000 });
   return response;

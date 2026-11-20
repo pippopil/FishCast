@@ -386,6 +386,7 @@ export const FishMap: React.FC<FishMapProps> = ({
           properties: {
             id: r.id,
             species: r.fish_species_name,
+            outcome: r.outcome ?? 'catch',
             author: r.author_nickname,
             verified: r.author_verified ? 1 : 0,
             bait: r.bait || '—',
@@ -640,7 +641,7 @@ export const FishMap: React.FC<FishMapProps> = ({
           source: 'catch-reports',
           filter: ['!', ['has', 'point_count']],
           paint: {
-            'circle-color': '#E11D48',
+            'circle-color': ['case', ['==', ['get', 'outcome'], 'no_bite'], '#64748B', '#E11D48'],
             'circle-radius': 7,
             'circle-stroke-width': 2,
             'circle-stroke-color': '#FFFFFF',
@@ -744,12 +745,22 @@ export const FishMap: React.FC<FishMapProps> = ({
       const f = e.features?.[0];
       if (!f || f.geometry.type !== 'Point') return;
       const coords = f.geometry.coordinates as [number, number];
-      const p = f.properties as { species?: string; author?: string; bait?: string; water_body?: string };
+      const p = f.properties as {
+        species?: string;
+        outcome?: string;
+        author?: string;
+        bait?: string;
+        water_body?: string;
+      };
+      const headline =
+        p.outcome === 'no_bite'
+          ? `Отметка рыбака — клёва не было (${p.species ?? 'Рыба'})`
+          : `По отметкам рыбаков — клюёт: ${p.species ?? 'Рыба'}`;
       new maplibregl.Popup({ offset: 12 })
         .setLngLat(coords)
         .setHTML(
           `<div class="text-xs text-slate-800">
-            <div class="font-bold text-slate-900">По отметкам рыбаков — клюёт: ${p.species ?? 'Рыба'}</div>
+            <div class="font-bold text-slate-900">${headline}</div>
             <div class="mt-1 text-slate-600">${p.water_body ?? ''}</div>
             <div class="mt-0.5 text-slate-600">Приманка: ${p.bait ?? '—'}</div>
             <div class="mt-0.5 text-slate-500">Автор: ${p.author ?? ''}</div>

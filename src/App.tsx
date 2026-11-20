@@ -14,6 +14,7 @@ import { useRealtimeReports } from './hooks/useRealtimeReports';
 import { apiUrl, buildFallbackWeather, fetchOpenMeteoWeatherDirect } from './lib/apiClient';
 import {
   analyzeWaterBody,
+  buildBiteForecastMetadata,
   buildSplitRouteMetrics,
   computeFIndexForecast,
   detectProspectiveZones,
@@ -58,7 +59,9 @@ import type {
   MapBbox,
   NearbyWaterBody,
   OfflineMapRegion,
+  ReportOutcome,
   ReportVisibility,
+  ReportWeatherVector,
   RouteMultiResult,
   SyncQueueItem,
   UserProfile,
@@ -445,7 +448,11 @@ export default function App() {
         setForecastLoading(true);
         const [detailRes, forecastRes, weatherRes] = await Promise.all([
           fetch(apiUrl(`/api/v1/water-bodies/${wb.id}`)),
-          fetch(apiUrl(`/api/v1/forecast?lat=${wb.center.lat}&lng=${wb.center.lng}&fish_id=${selectedFishId}`)),
+          fetch(
+            apiUrl(
+              `/api/v1/forecast?lat=${wb.center.lat}&lng=${wb.center.lng}&fish_id=${selectedFishId}&water_body_id=${encodeURIComponent(wb.id)}`
+            )
+          ),
           fetch(apiUrl(`/api/v1/weather?lat=${wb.center.lat}&lng=${wb.center.lng}`)),
         ]);
         const [detailJson, forecastJson, weatherJson] = await Promise.all([
@@ -475,20 +482,39 @@ export default function App() {
         const pts = SEED_BATHYMETRY_POINTS.filter((p) => p.water_body_id === wb.id);
         const an = analyzeWaterBody({
           waterBody: wb,
-          crowdReportCount: reports.filter((r) => r.water_body_id === wb.id).length,
+          crowdReportCount: reports.filter((r) => r.water_body_id === wb.id && r.outcome !== 'no_bite').length,
         });
-        const wx = (await fetchOpenMeteoWeatherDirect(wb.center.lat, wb.center.lng)) ?? buildFallbackWeather(wb.center.lat, wb.center.lng);
+        const wx =
+          (await fetchOpenMeteoWeatherDirect(wb.center.lat, wb.center.lng)) ??
+          buildFallbackWeather(wb.center.lat, wb.center.lng);
         const sp = speciesList.find((s) => s.id === selectedFishId) ?? SEED_SPECIES[0];
-        const slots = computeFIndexForecast({ species: sp, weather: wx, baseDate: new Date() });
+        const nowDate = new Date();
+        const slots = computeFIndexForecast({
+          species: sp,
+          weather: wx,
+          baseDate: nowDate,
+          waterBody: wb,
+          reports,
+        });
+        const meta = buildBiteForecastMetadata({
+          weather: wx,
+          species: sp,
+          waterBody: wb,
+          reports,
+          baseDate: nowDate,
+        });
         const fc: BiteForecastResponse = {
           lat: wb.center.lat,
           lng: wb.center.lng,
           fish_id: sp.id,
           fish_name: sp.name,
+          water_body_id: wb.id,
           source: 'open-meteo-fallback',
           cached: false,
-          disclaimer: 'Автономный вероятностный расчёт F-Индекса по данным Open-Meteo и локальной модели.',
+          disclaimer:
+            'Автономный вероятностный расчёт F-Индекса по почасовым данным Open-Meteo, параметрам водоёма и локальным отчётам.',
           slots,
+          ...meta,
         };
         if (!active) return;
         setDepthPoints(pts);
@@ -512,7 +538,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [selectedWaterBody?.id, selectedFishId, isOnline]);
+  }, [selectedWaterBody?.id, selectedFishId, isOnline, reports.length]);
 
   // Auto-flush IndexedDB sync_queue when connectivity returns
   const flushSyncQueue = useCallback(async () => {
@@ -566,8 +592,9 @@ export default function App() {
       species: activeSpecies,
       waterBody: selectedWaterBody,
       month: new Date().getMonth() + 1,
+      isIceRegime: forecast?.regime === 'ice',
     });
-  }, [activeSpecies, selectedWaterBody]);
+  }, [activeSpecies, selectedWaterBody, forecast?.regime]);
 
   // Fallback weather snapshot when offline before first fetch
   const effectiveWeather = useMemo<WeatherSnapshot>(
@@ -981,6 +1008,7 @@ export default function App() {
     lng: number | null;
     fish_species_id: string;
     water_body_id: string | null;
+    outcome?: ReportOutcome;
     weight_kg?: number | null;
     length_cm?: number | null;
     bait: string;
@@ -1000,13 +1028,33 @@ export default function App() {
     const wb = payload.water_body_id
       ? waterBodies.find((w) => w.id === payload.water_body_id) ?? null
       : null;
+    const outcome: ReportOutcome = payload.outcome === 'no_bite' ? 'no_bite' : 'catch';
+
+    const weatherVector: ReportWeatherVector | undefined = weather
+      ? {
+          pressure_hpa: weather.pressure_hpa,
+          pressure_trend: weather.pressure_trend,
+          pressure_delta_6h: weather.pressure_delta_6h,
+          water_temp_c: forecast?.estimated_water_temp_c ?? weather.water_temp_c,
+          air_temp_c: weather.air_temp_c,
+          wind_speed_ms: weather.wind_speed_ms,
+          wind_direction_label: weather.wind_direction_label,
+          cloud_cover_pct: weather.cloud_cover_pct,
+          precipitation_mm: weather.precipitation_mm,
+          hour_local: new Date().getHours(),
+        }
+      : undefined;
 
     const fullPayload = {
       ...payload,
+      outcome,
+      weight_kg: outcome === 'no_bite' ? null : payload.weight_kg ?? null,
+      length_cm: outcome === 'no_bite' ? null : payload.length_cm ?? null,
       client_event_id: clientEventId,
       weather_summary: weather
         ? `${weather.pressure_mmhg} мм рт. ст. · ${weather.air_temp_c}°C · ${weather.wind_direction_label} ${weather.wind_speed_ms} м/с`
         : '',
+      weather_snapshot: weatherVector,
       created_at: new Date().toISOString(),
     };
 
@@ -1025,11 +1073,13 @@ export default function App() {
         updated_at: fullPayload.created_at,
         fish_species_id: species?.id ?? payload.fish_species_id,
         fish_species_name: species?.name ?? payload.fish_species_id,
-        weight_kg: payload.weight_kg ?? null,
-        length_cm: payload.length_cm ?? null,
+        outcome,
+        weight_kg: fullPayload.weight_kg,
+        length_cm: fullPayload.length_cm,
         bait: payload.bait,
         retrieve: payload.retrieve ?? '',
         weather_summary: fullPayload.weather_summary,
+        weather_snapshot: weatherVector,
         photo_url: payload.photo_url,
         notes: payload.notes,
         visibility: payload.visibility,
@@ -1063,7 +1113,13 @@ export default function App() {
       if (json.report) {
         handleIncomingReport(json.report);
       }
-      showToast(payload.source === 'quick_mark' ? 'Метка «Клюёт сейчас» отправлена!' : 'Запись добавлена в дневник.');
+      showToast(
+        outcome === 'no_bite'
+          ? 'Отметка «Клёва не было» сохранена и учтена в калибровке прогноза.'
+          : payload.source === 'quick_mark'
+            ? 'Метка «Клюёт сейчас» отправлена и учтена в прогнозе!'
+            : 'Запись добавлена в дневник и учтена в калибровке прогноза.'
+      );
       return null;
     } catch {
       return 'Ошибка сети при отправке.';

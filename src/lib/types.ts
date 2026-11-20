@@ -132,6 +132,16 @@ export interface LureRecommendationResult {
   reasons: string[];
 }
 
+export interface HourlyWeatherPoint {
+  time: string; // ISO local/UTC timestamp
+  temp_c: number;
+  pressure_hpa: number;
+  wind_speed_ms: number;
+  wind_direction_deg: number;
+  cloud_cover_pct: number;
+  precipitation_mm: number;
+}
+
 export interface WeatherSnapshot {
   lat: number;
   lng: number;
@@ -139,14 +149,21 @@ export interface WeatherSnapshot {
   pressure_hpa: number;
   pressure_mmhg: number;
   pressure_trend: 'rising' | 'steady' | 'falling';
+  pressure_delta_6h?: number; // hPa change over last 6h
+  pressure_stability_48h?: number; // 0..1 (1 = rock steady over 48h)
   air_temp_c: number;
   water_temp_c: number;
+  avg_air_temp_7d_c?: number;
+  avg_air_temp_14d_c?: number;
   wind_speed_ms: number;
   wind_direction_deg: number;
   wind_direction_label: string;
+  cloud_cover_pct?: number; // 0..100
   precipitation_mm: number;
+  recent_rain_72h_mm?: number; // cumulative mm over past 72h
   moon_phase: string;
   moon_illumination: number;
+  hourly?: HourlyWeatherPoint[];
   source: 'open-meteo' | 'open-meteo-cached' | 'offline-fallback';
 }
 
@@ -157,6 +174,10 @@ export interface BiteForecastSlot {
   f_index: number; // 0..100
   probability_label: 'высокая вероятность' | 'средняя вероятность' | 'низкая вероятность';
   factors: string[];
+  temp_c?: number;
+  wind_speed_ms?: number;
+  pressure_mmhg?: number;
+  cloud_cover_pct?: number;
 }
 
 export interface BiteForecastResponse {
@@ -164,10 +185,20 @@ export interface BiteForecastResponse {
   lng: number;
   fish_id: string;
   fish_name: string;
+  water_body_id?: string | null;
   source: 'actigator' | 'open-meteo-fallback';
   cached: boolean;
   disclaimer: string;
   slots: BiteForecastSlot[];
+  confidence_level?: 'high' | 'medium' | 'low';
+  confidence_score?: number; // 0..100
+  confidence_label?: string;
+  calibration_delta?: number;
+  calibration_reports_used?: number;
+  regime?: 'open_water' | 'ice';
+  sunrise?: string;
+  sunset?: string;
+  estimated_water_temp_c?: number;
 }
 
 export interface GoodBiteWaterBodyItem {
@@ -185,6 +216,20 @@ export interface GoodBiteWaterBodyItem {
 
 export type ReportVisibility = 'public' | 'friends' | 'private';
 export type ReportSource = 'quick_mark' | 'diary';
+export type ReportOutcome = 'catch' | 'no_bite';
+
+export interface ReportWeatherVector {
+  pressure_hpa: number;
+  pressure_trend: 'rising' | 'steady' | 'falling';
+  pressure_delta_6h?: number;
+  water_temp_c: number;
+  air_temp_c: number;
+  wind_speed_ms: number;
+  wind_direction_label: string;
+  cloud_cover_pct?: number;
+  precipitation_mm: number;
+  hour_local?: number;
+}
 
 export interface CatchReport {
   id: string;
@@ -200,11 +245,13 @@ export interface CatchReport {
   updated_at: string;
   fish_species_id: string;
   fish_species_name: string;
+  outcome?: ReportOutcome;
   weight_kg: number | null;
   length_cm: number | null;
   bait: string;
   retrieve: string;
   weather_summary: string;
+  weather_snapshot?: ReportWeatherVector;
   photo_url: string | null;
   notes: string;
   visibility: ReportVisibility;
